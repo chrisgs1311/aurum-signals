@@ -9,7 +9,11 @@ from datetime import datetime, timezone
 import datetime as _dt
 
 # ── THREAD SAFETY ─────────────────────────────────────────
-_data_lock = threading.Lock()  # protege price_history, _scalp_prices_*, _ohlc_candles
+_data_lock    = threading.Lock()  # protege price_history, _scalp_prices_*, _ohlc_candles
+_control_lock = threading.Lock()  # protege _current_control
+_news_lock    = threading.Lock()  # protege _news_cache, _news_alerted
+_risk_lock    = threading.Lock()  # protege RISK_STATE
+_cache_lock   = threading.Lock()  # protege _cache_store
 
 # ── RETRY HELPER ──────────────────────────────────────────
 def _fetch_with_retry(url, headers=None, timeout=10, retries=3, backoff=1.0):
@@ -31,11 +35,13 @@ def _fetch_with_retry(url, headers=None, timeout=10, retries=3, backoff=1.0):
 # ── CACHE EN MEMORIA ─────────────────────────────────────
 _cache_store = {}
 def cached(key, ttl=30):
-    e = _cache_store.get(key)
-    if e and time.time() - e["ts"] < ttl: return e["val"]
+    with _cache_lock:
+        e = _cache_store.get(key)
+        if e and time.time() - e["ts"] < ttl: return e["val"]
     return None
 def set_cache(key, val):
-    _cache_store[key] = {"val": val, "ts": time.time()}
+    with _cache_lock:
+        _cache_store[key] = {"val": val, "ts": time.time()}
 
 # ── HISTORIAL GLOBAL DE PRECIOS (thread-safe) ────────────
 price_history = []
@@ -105,12 +111,13 @@ def _fetch_forex_factory_calendar():
 def _get_news_events():
     """Devuelve eventos de la semana, cache de 6 horas."""
     now = time.time()
-    if now - _news_cache["fetched_at"] > 21600 or not _news_cache["events"]:
-        events = _fetch_forex_factory_calendar()
-        if events:
-            _news_cache["events"] = events
-            _news_cache["fetched_at"] = now
-    return _news_cache["events"]
+    with _news_lock:
+        if now - _news_cache["fetched_at"] > 21600 or not _news_cache["events"]:
+            events = _fetch_forex_factory_calendar()
+            if events:
+                _news_cache["events"] = events
+                _news_cache["fetched_at"] = now
+        return list(_news_cache["events"])
 
 def is_news_time():
     """v6.2: usa calendario REAL de Forex Factory."""
@@ -131,17 +138,19 @@ def check_upcoming_news():
         for alert_min in ALERT_MINUTES_BEFORE:
             if abs(mins_until - alert_min) < 0.6:
                 key = f"{ev['name']}_{ev['datetime_utc'].isoformat()}_{alert_min}"
-                if key not in _news_alerted:
-                    _news_alerted.add(key)
-                    alerts.append({
-                        "name": ev["name"],
-                        "datetime_utc": ev["datetime_utc"],
-                        "minutes_before": alert_min,
-                        "impact": ev["impact"],
-                    })
+                with _news_lock:
+                    if key not in _news_alerted:
+                        _news_alerted.add(key)
+                        alerts.append({
+                            "name": ev["name"],
+                            "datetime_utc": ev["datetime_utc"],
+                            "minutes_before": alert_min,
+                            "impact": ev["impact"],
+                        })
     # Limpiar tracking viejo
-    if len(_news_alerted) > 200:
-        _news_alerted.clear()
+    with _news_lock:
+        if len(_news_alerted) > 200:
+            _news_alerted.clear()
     return alerts
 
 # ── MOTOR IA ─────────────────────────────────────────────
@@ -219,22 +228,23 @@ def update_control_state(ai_instance, prices, is_news=False):
     mk_sig, mk_lvl, mk_factors = MarketLayer.get_signal(prices, is_news)
     decision = ControlLayer.decide(m_sig, m_lvl, mk_sig, mk_lvl)
     now = time.time()
-    if decision["state"] != _current_control["state"]:
-        if now >= _current_control["lock_until"]:
-            print(f"  🎛 CONTROL: {_current_control['state']} → {decision['state']}")
-            _current_control = {
-                "state":      decision["state"],
-                "thresholds": decision["thresholds"],
-                "lock_until": now + decision["lock_sec"],
-                "combined":   decision["combined"],
-            }
+    with _control_lock:
+        if decision["state"] != _current_control["state"]:
+            if now >= _current_control["lock_until"]:
+                print(f"  🎛 CONTROL: {_current_control['state']} → {decision['state']}")
+                _current_control = {
+                    "state":      decision["state"],
+                    "thresholds": decision["thresholds"],
+                    "lock_until": now + decision["lock_sec"],
+                    "combined":   decision["combined"],
+                }
+            else:
+                remaining = int((_current_control["lock_until"] - now) / 60)
+                print(f"  🔒 LOCK: {_current_control['state']} | {remaining}min")
         else:
-            remaining = int((_current_control["lock_until"] - now) / 60)
-            print(f"  🔒 LOCK: {_current_control['state']} | {remaining}min")
-    else:
-        _current_control["thresholds"] = decision["thresholds"]
-        _current_control["combined"]   = decision["combined"]
-    return _current_control
+            _current_control["thresholds"] = decision["thresholds"]
+            _current_control["combined"]   = decision["combined"]
+        return dict(_current_control)
 
 class LogisticModel:
     def __init__(self, n_features=11):
@@ -517,7 +527,7 @@ class AurumAI:
         pvs   = max(-2, min(2, (p[-1]-sma20)/(sma20+1e-9)*100))
         mom5  = max(-2, min(2, (p[-1]-p[-6])/(p[-6]+1e-9)*100))
         mom10 = max(-2, min(2, (p[-1]-p[-11])/(p[-11]+1e-9)*100)) if len(p) > 11 else 0
-        rets  = [(p[i]-p[i-1])/p[i-1] for i in range(len(p)-10, len(p))]
+        rets  = [(p[i]-p[i-1])/(p[i-1] + 1e-9) for i in range(len(p)-10, len(p))]
         mean_r = sum(rets)/len(rets)
         vol = math.sqrt(sum((r-mean_r)**2 for r in rets)/len(rets)) * 100
         # v6: features de contexto temporal
@@ -645,12 +655,13 @@ def ai_train_if_needed(prices):
 
 def ai_predict(prices):
     if not _ai.trained or len(prices) < 35: return None, None
-    ctrl_state = _current_control["state"]
+    with _control_lock:
+        ctrl_state  = _current_control["state"]
+        buy_thresh  = _current_control["thresholds"]["buy"]
+        sell_thresh = _current_control["thresholds"]["sell"]
     if ctrl_state == "PAUSED": return None, "PAUSED"
     prob = _ai.predict_proba(prices)
     if prob is None: return None, None
-    buy_thresh  = _current_control["thresholds"]["buy"]
-    sell_thresh = _current_control["thresholds"]["sell"]
     if   prob >= buy_thresh:  signal = "COMPRAR"
     elif prob <= sell_thresh: signal = "VENDER"
     else:                     signal = "ESPERAR"
@@ -707,7 +718,7 @@ def _push_sse(event_type, data):
 MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
 
 # v6.3: Twelve Data como backup
-TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY", "dd53883de1a84cccaf65bf7f4e7a4756")
+TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY", "")
 
 # v6.4: URLs de precio — Massive PRIMERO (si hay key), luego gold-api, luego Twelve Data
 # Massive da el mismo feed que TradingView Forex.com con unlimited calls
@@ -744,7 +755,7 @@ _PRICE_APIS.append((
 # Backup 3: metalpriceapi
 _PRICE_APIS.append((
     "https://api.metalpriceapi.com/v1/latest?api_key=demo&base=XAU&currencies=USD",
-    lambda d: {"price": 1.0/float(d["rates"]["USD"]), "ch": 0, "chp": 0} if d.get("rates",{}).get("USD") else None,
+    lambda d: {"price": float(d["rates"]["USD"]), "ch": 0, "chp": 0} if d.get("rates",{}).get("USD") else None,
 ))
 
 if MASSIVE_API_KEY:
@@ -864,11 +875,11 @@ def _ws_connect_twelve():
         raise Exception(f"WS handshake failed: {response[:100]}")
     return sock
 
-def _ws_send_frame(sock, payload):
-    """Envía un frame WebSocket de texto (opcode 0x1) con masking."""
-    data = payload.encode() if isinstance(payload, str) else payload
+def _ws_send_frame(sock, payload, opcode=0x81):
+    """Envía un frame WebSocket con masking. opcode=0x81 text, 0x8A pong."""
+    data = payload.encode() if isinstance(payload, str) else (payload if isinstance(payload, (bytes, bytearray)) else b"")
     length = len(data)
-    frame = bytearray([0x81])  # FIN + text frame
+    frame = bytearray([0x80 | (opcode & 0x0F)])  # FIN + opcode
     mask_bit = 0x80
     if length < 126:
         frame.append(mask_bit | length)
@@ -895,17 +906,17 @@ def _ws_recv_frame(sock):
         return data
     header = recv_exact(2)
     opcode = header[0] & 0x0F
-    if opcode == 0x8:  # close frame
-        raise Exception("WS close frame received")
-    if opcode == 0x9:  # ping
-        _ws_send_frame(sock, "")  # responder pong
-        return None
     length = header[1] & 0x7F
     if length == 126:
         length = struct.unpack(">H", recv_exact(2))[0]
     elif length == 127:
         length = struct.unpack(">Q", recv_exact(8))[0]
-    payload = recv_exact(length)
+    payload = recv_exact(length) if length > 0 else b""
+    if opcode == 0x8:  # close frame
+        raise Exception("WS close frame received")
+    if opcode == 0x9:  # ping — responder pong con mismo payload (RFC 6455)
+        _ws_send_frame(sock, payload, opcode=0x8A)
+        return None
     return payload.decode("utf-8", errors="ignore")
 
 def _worker_websocket_massive():
@@ -919,6 +930,7 @@ def _worker_websocket_massive():
     4) Recibir arrays de eventos
     """
     while True:
+        sock = None
         try:
             if not MASSIVE_API_KEY:
                 time.sleep(60)
@@ -1036,6 +1048,7 @@ def _worker_websocket():
             _live_cache["ws_active"] = False
             time.sleep(60)
             continue
+        sock = None
         try:
             print("  🔌 Conectando WebSocket Twelve Data...")
             sock = _ws_connect_twelve()
@@ -1330,29 +1343,34 @@ def risk_can_trade():
     """Devuelve (can_trade, reason). Verifica todos los límites de riesgo."""
     now = time.time()
     # ¿Está en circuit breaker activo?
-    if RISK_STATE["paused_until"] > now:
-        remaining = int((RISK_STATE["paused_until"] - now) / 60)
-        return False, f"🚫 Circuit breaker: {RISK_STATE['pause_reason']} — {remaining}min restantes"
+    with _risk_lock:
+        paused_until = RISK_STATE["paused_until"]
+        pause_reason = RISK_STATE["pause_reason"]
+    if paused_until > now:
+        remaining = int((paused_until - now) / 60)
+        return False, f"🚫 Circuit breaker: {pause_reason} — {remaining}min restantes"
     # Daily loss limit
     day = risk_get_today_stats()
     if day["total_r"] <= RISK_STATE["daily_loss_limit_r"]:
-        # Pausar hasta medianoche UTC
         tomorrow = _dt.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + _dt.timedelta(days=1)
-        RISK_STATE["paused_until"] = tomorrow.timestamp()
-        RISK_STATE["pause_reason"] = f"Daily loss limit ({day['total_r']}R)"
-        remaining = int((RISK_STATE["paused_until"] - now) / 60)
+        with _risk_lock:
+            RISK_STATE["paused_until"] = tomorrow.timestamp()
+            RISK_STATE["pause_reason"] = f"Daily loss limit ({day['total_r']}R)"
+            paused_until = RISK_STATE["paused_until"]
+        remaining = int((paused_until - now) / 60)
         return False, f"🚫 DAILY LOSS LIMIT alcanzado ({day['total_r']}R) — pausa {remaining}min hasta medianoche UTC"
     # Weekly loss limit
     week = risk_get_week_stats()
     if week["total_r"] <= RISK_STATE["weekly_loss_limit_r"]:
-        # Pausa 24h
-        RISK_STATE["paused_until"] = now + 86400
-        RISK_STATE["pause_reason"] = f"Weekly loss ({week['total_r']}R)"
+        with _risk_lock:
+            RISK_STATE["paused_until"] = now + 86400
+            RISK_STATE["pause_reason"] = f"Weekly loss ({week['total_r']}R)"
         return False, f"🚫 WEEKLY LOSS LIMIT ({week['total_r']}R) — pausa 24h"
     # Consecutive losses circuit breaker
     if day["consecutive_losses"] >= RISK_STATE["max_consecutive_losses"]:
-        RISK_STATE["paused_until"] = now + (RISK_STATE["circuit_breaker_hours"] * 3600)
-        RISK_STATE["pause_reason"] = f"{day['consecutive_losses']} pérdidas consecutivas"
+        with _risk_lock:
+            RISK_STATE["paused_until"] = now + (RISK_STATE["circuit_breaker_hours"] * 3600)
+            RISK_STATE["pause_reason"] = f"{day['consecutive_losses']} pérdidas consecutivas"
         return False, f"🚫 CIRCUIT BREAKER: {day['consecutive_losses']} pérdidas seguidas — pausa {RISK_STATE['circuit_breaker_hours']}h"
     return True, "OK"
 
