@@ -1098,7 +1098,7 @@ canvas{width:100%;display:block;filter:drop-shadow(0 0 1px rgba(201,168,76,.1))}
 </head>
 <body>
 <header>
-  <div class="logo">AURUM<span>BOT DE SEÑALES XAU/USD v7.0</span></div>
+  <div class="logo">AURUM<span>BOT DE SEÑALES XAU/USD v8.0</span></div>
   <div class="header-right">
     <div class="tg-status" id="tgStatus">📵 TELEGRAM OFF</div>
     <button class="sound-toggle on" id="soundBtn" onclick="toggleSound()">🔔 ON</button>
