@@ -141,7 +141,8 @@ _paper_trades = []
 _paper_lock   = threading.Lock()
 
 # ── SIGNAL DEDUP ──────────────────────────────────────────
-_last_scalp_signal = {"key": "", "time": 0}
+_last_scalp_signal  = {"key": "", "time": 0}
+_last_any_signal_ts = 0   # global cooldown — cualquier señal
 
 # ── PRE-SIGNAL STATE ──────────────────────────────────────
 _pre_signal = {
@@ -171,9 +172,10 @@ PERF_WINDOW = 50
 PERF_MIN_N  = 20
 
 # ── SCORING THRESHOLDS ────────────────────────────────────
-SCORE_SNIPER = 85
-SCORE_NORMAL = 78
-SCORE_EARLY  = 999   # desactivado — causaba señales falsas sin BOS
+SCORE_SNIPER        = 88
+SCORE_NORMAL        = 82
+SCORE_EARLY         = 999    # desactivado — causaba señales falsas sin BOS
+SIGNAL_COOLDOWN_SEC = 300    # cooldown global mínimo entre cualquier señal (5 min)
 
 # ── MACRO CACHES ─────────────────────────────────────────
 _mtf_cache  = {"prices_1h": [], "last_update": 0}
