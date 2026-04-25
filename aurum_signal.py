@@ -8,9 +8,10 @@ from aurum_state import (
     _ohlc_candles_5m, _ohlc_candles_15m,
     _ohlc_timers, _last_scalp_signal, _pre_signal,
     _current_control, _live_cache,
-    SCORE_SNIPER, SCORE_NORMAL, SCORE_EARLY,
+    SCORE_SNIPER, SCORE_NORMAL, SCORE_EARLY, SIGNAL_COOLDOWN_SEC,
     is_data_stale,
 )
+import aurum_state as _state
 from aurum_models import _ai, ai_predict
 from aurum_news import (
     is_news_time, check_dxy_correlation, check_yields_for_gold,
@@ -80,12 +81,12 @@ def _is_real_sweep(prices, sweep_level, bias, candles=None, atr=None):
         penetration = sweep_level - min(prices[-5:])
     else:
         penetration = max(prices[-5:]) - sweep_level
-    if penetration < atr * 0.3:
+    if penetration < atr * 0.5:
         return False
     if len(prices) >= 3:
         body = abs(prices[-1] - prices[-2])
         rng  = max(prices[-3:]) - min(prices[-3:]) + 1e-9
-        if body / rng < 0.35:
+        if body / rng < 0.45:
             return False
     if bias == "bullish" and prices[-1] < prices[-2]: return False
     if bias == "bearish" and prices[-1] > prices[-2]: return False
@@ -170,20 +171,34 @@ def _detect_sweep_ohlc(candles, bias):
 
 # ── BOS / FVG ─────────────────────────────────────────────
 def detect_bos_scalp(prices, bias):
-    if len(prices) < 15: return False, "none"
+    if len(prices) < 20: return False, "none"
     p = prices
     if bias == "bullish":
-        highs = _swing_highs(p[:-2], n=2)
+        highs = _swing_highs(p[:-3], n=3)
         if highs and p[-1] > highs[-1][1]:
             return True, "BOS alcista"
-        if len(p) >= 10 and p[-1] > p[-5] and p[-5] < p[-10]:
-            return True, "CHOCH"
+        # CHOCH: requiere que previo swing low sea roto con momentum real (2% ATR minimo)
+        if len(p) >= 15:
+            atr = sum(abs(p[i]-p[i-1]) for i in range(len(p)-14, len(p))) / 14
+            prev_swing_lows = _swing_lows(p[:-5], n=3)
+            if prev_swing_lows:
+                last_low = prev_swing_lows[-1][1]
+                # precio rompe swing high despues de hacer un low mas alto
+                local_lows = _swing_lows(p[-15:], n=2)
+                if local_lows and local_lows[-1][1] > last_low and (p[-1] - local_lows[-1][1]) > atr * 1.5:
+                    return True, "CHOCH"
     if bias == "bearish":
-        lows = _swing_lows(p[:-2], n=2)
+        lows = _swing_lows(p[:-3], n=3)
         if lows and p[-1] < lows[-1][1]:
             return True, "BOS bajista"
-        if len(p) >= 10 and p[-1] < p[-5] and p[-5] > p[-10]:
-            return True, "CHOCH"
+        if len(p) >= 15:
+            atr = sum(abs(p[i]-p[i-1]) for i in range(len(p)-14, len(p))) / 14
+            prev_swing_highs = _swing_highs(p[:-5], n=3)
+            if prev_swing_highs:
+                last_high = prev_swing_highs[-1][1]
+                local_highs = _swing_highs(p[-15:], n=2)
+                if local_highs and local_highs[-1][1] < last_high and (local_highs[-1][1] - p[-1]) > atr * 1.5:
+                    return True, "CHOCH"
     return False, "none"
 
 
@@ -197,11 +212,11 @@ def detect_fvg_scalp(prices, bias, candles=None):
         high3 = prices[i]
         if bias == "bullish" and high3 > low1:
             gap = high3 - low1
-            if gap > prices[-1] * 0.0008:
+            if gap > prices[-1] * 0.0015:
                 return True, round(low1, 2), round(high3, 2)
         if bias == "bearish" and high3 < low1:
             gap = low1 - high3
-            if gap > prices[-1] * 0.0008:
+            if gap > prices[-1] * 0.0015:
                 return True, round(high3, 2), round(low1, 2)
     return False, 0, 0
 
@@ -213,12 +228,12 @@ def _detect_fvg_ohlc(candles, bias):
         if bias == "bullish":
             if c3["l"] > c1["h"]:
                 gap = c3["l"] - c1["h"]
-                if gap > c3["c"] * 0.0005:
+                if gap > c3["c"] * 0.001:
                     return True, round(c1["h"], 2), round(c3["l"], 2)
         if bias == "bearish":
             if c3["h"] < c1["l"]:
                 gap = c1["l"] - c3["h"]
-                if gap > c3["c"] * 0.0005:
+                if gap > c3["c"] * 0.001:
                     return True, round(c3["h"], 2), round(c1["l"], 2)
     return False, 0, 0
 
@@ -231,8 +246,8 @@ def get_ema_bias(prices):
         for v in arr[n:]: e = v*k+e*(1-k)
         return e
     e9, e21 = ema(prices, 9), ema(prices, 21)
-    if   e9 > e21 * 1.0005: return "bullish"
-    elif e9 < e21 * 0.9995: return "bearish"
+    if   e9 > e21 * 1.001: return "bullish"
+    elif e9 < e21 * 0.999: return "bearish"
     return None
 
 
@@ -403,9 +418,14 @@ _ict_prices_15m = _scalp_prices_15m
 
 # ── MAIN SIGNAL ENGINE ────────────────────────────────────
 def run_ict_engine(current_price, atr):
-    """AURUM SCALP v6.2 — Motor principal ICT."""
+    """AURUM SCALP v6.3 — Motor principal ICT."""
     if len(_ohlc_candles_5m) < 20:  return None
     if len(_ohlc_candles_15m) < 15: return None
+
+    # Cooldown global: mínimo SIGNAL_COOLDOWN_SEC entre cualquier señal
+    now_g = time.time()
+    if now_g - _state._last_any_signal_ts < SIGNAL_COOLDOWN_SEC:
+        return None
 
     ohlc5  = _ohlc_candles_5m
     ohlc15 = _ohlc_candles_15m
@@ -491,12 +511,13 @@ def run_ict_engine(current_price, atr):
                 sl = current_price - atr * 1.0 if is_buy else current_price + atr * 1.0
                 rr      = 1.2
                 session = get_session_name()
-                sig_key = f"EARLY_{direction}_{round(current_price/5)*5}"
+                sig_key = f"EARLY_{direction}_{round(current_price/10)*10}"
                 now = time.time()
-                if sig_key == _last_scalp_signal["key"] and now - _last_scalp_signal["time"] < 60:
+                if sig_key == _last_scalp_signal["key"] and now - _last_scalp_signal["time"] < 600:
                     return None
-                _last_scalp_signal["key"]  = sig_key
-                _last_scalp_signal["time"] = now
+                _last_scalp_signal["key"]   = sig_key
+                _last_scalp_signal["time"]  = now
+                _state._last_any_signal_ts  = now
                 reasons = [f"✔ Sweep REVERSA ({sweep_conf:.0%})", "✔ FVG entry (early)", f"✔ {details.get('ml','')}"]
                 dirstr  = "BUY" if is_buy else "SELL"
                 msg = (
@@ -593,13 +614,14 @@ def run_ict_engine(current_price, atr):
             details["filtered"] = "sin confirmación de vela 5M"
             return None
 
-    # COOLDOWN
-    sig_key = f"{direction}_{round(current_price/5)*5}"
+    # COOLDOWN por clave específica
+    sig_key = f"{direction}_{round(current_price/10)*10}"
     now = time.time()
-    if sig_key == _last_scalp_signal["key"] and now - _last_scalp_signal["time"] < 60:
+    if sig_key == _last_scalp_signal["key"] and now - _last_scalp_signal["time"] < 600:
         return None
-    _last_scalp_signal["key"]  = sig_key
-    _last_scalp_signal["time"] = now
+    _last_scalp_signal["key"]   = sig_key
+    _last_scalp_signal["time"]  = now
+    _state._last_any_signal_ts  = now
 
     is_buy = direction == "COMPRAR"
     tp_mult, sl_mult = (2.5, 1.0) if score >= SCORE_SNIPER else (1.5, 1.0)
