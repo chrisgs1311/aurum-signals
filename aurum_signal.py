@@ -418,17 +418,17 @@ _ict_prices_15m = _scalp_prices_15m
 
 # ── MAIN SIGNAL ENGINE ────────────────────────────────────
 def run_ict_engine(current_price, atr):
-    """AURUM SCALP v6.3 — Motor principal ICT."""
+    """AURUM TRADE v7.0 — Trades reales en 15m. Estructura ICT con confluencia HTF."""
     if len(_ohlc_candles_5m) < 20:  return None
-    if len(_ohlc_candles_15m) < 15: return None
+    if len(_ohlc_candles_15m) < 20: return None
 
-    # Cooldown global: mínimo SIGNAL_COOLDOWN_SEC entre cualquier señal
+    # Cooldown global: mínimo 1 hora entre señales
     now_g = time.time()
     if now_g - _state._last_any_signal_ts < SIGNAL_COOLDOWN_SEC:
         return None
 
-    ohlc5  = _ohlc_candles_5m
-    ohlc15 = _ohlc_candles_15m
+    ohlc5  = list(_ohlc_candles_5m)
+    ohlc15 = list(_ohlc_candles_15m)
     p5  = [c["c"] for c in ohlc5]
     if current_price and abs(current_price - p5[-1]) > 0.01:
         p5 = p5 + [current_price]
@@ -436,209 +436,158 @@ def run_ict_engine(current_price, atr):
 
     if not is_trading_session(): return None
 
-    regime_info = detect_market_regime(p5)
+    # Régimen basado en 15m — mercados laterales o extremos no se tradean
+    regime_info = detect_market_regime(p15)
     if not regime_info["should_trade"]: return None
 
-    # Multi-timeframe confluence
-    mtf_bias_4h = mtf_bias_1h = None
+    # ATR real de 15m — stops y targets de trade real (no scalp)
+    atr_15m = sum(abs(ohlc15[i]["c"] - ohlc15[i-1]["c"])
+                  for i in range(len(ohlc15)-14, len(ohlc15))) / 14
+    if atr_15m <= 0: atr_15m = atr * 3
+
+    # Multi-timeframe: bias 15m es obligatorio, HTF suma puntos
+    bias_15m = get_ema_bias(p15)
+    if not bias_15m: return None
+
     with _data_lock:
         ohlc4h = list(_live_cache.get("ohlc_4h", []))
         ohlc1h = list(_live_cache.get("ohlc_1h", []))
-    if ohlc4h and len(ohlc4h) >= 21:
-        mtf_bias_4h = get_ema_bias([c["close"] for c in ohlc4h])
-    if ohlc1h and len(ohlc1h) >= 21:
-        mtf_bias_1h = get_ema_bias([c["close"] for c in ohlc1h])
-    mtf_bias_15m = get_ema_bias(p15)
+    mtf_bias_4h = get_ema_bias([c["close"] for c in ohlc4h]) if len(ohlc4h) >= 21 else None
+    mtf_bias_1h = get_ema_bias([c["close"] for c in ohlc1h]) if len(ohlc1h) >= 21 else None
 
+    # 15m debe coincidir con 5m — sin divergencia intra-timeframe
     bias_5m = get_ema_bias(p5)
-    if not bias_5m: return None
+    if bias_5m and bias_5m != bias_15m: return None
 
-    htf_biases = [b for b in [mtf_bias_4h, mtf_bias_1h, mtf_bias_15m] if b]
-    if len(htf_biases) >= 2:
-        aligned = sum(1 for b in htf_biases if b == bias_5m)
-        if aligned < 2: return None
-
-    bias = mtf_bias_15m or get_ema_bias(p15)
-    if not bias: return None
-
-    detect_pre_signal(p5, candles=ohlc5)
-
+    bias      = bias_15m
     direction = "COMPRAR" if bias == "bullish" else "VENDER"
-    score   = 0
-    details = {"bias": bias, "direction": direction}
+    score     = 0
+    details   = {"bias": bias, "direction": direction, "tf": "15M"}
 
-    # 1. LIQUIDITY SWEEP — OBLIGATORIO
-    swept, sweep_level, rejection = detect_sweep_and_rejection(p5, bias, candles=ohlc5)
+    # HTF alignment bonus (no bloquea, pero suma al score)
+    htf_aligned = 0
+    if mtf_bias_4h == bias: htf_aligned += 1; score += 10; details["htf_4h"] = "✓ 4H alineado"
+    if mtf_bias_1h == bias: htf_aligned += 1; score += 8;  details["htf_1h"] = "✓ 1H alineado"
+
+    detect_pre_signal(p15, candles=ohlc15)
+
+    # 1. LIQUIDITY SWEEP en 15m — OBLIGATORIO
+    swept, sweep_level, rejection = detect_sweep_and_rejection(p15, bias, candles=ohlc15)
     if not swept: return None
-    if not _is_real_sweep(p5, sweep_level, bias, candles=ohlc5, atr=atr):
-        details["filtered"] = "micro-sweep filtrado"
+    if not _is_real_sweep(p15, sweep_level, bias, candles=ohlc15, atr=atr_15m):
         return None
     score += 40
-    details["sweep"] = f"Sweep ${sweep_level} | rej={rejection:.1f}"
+    details["sweep"] = f"Sweep 15M ${sweep_level} | rej={rejection:.1f}"
 
-    sweep_type, sweep_conf = _classify_sweep_type(p5, bias, candles=ohlc5)
+    sweep_type, sweep_conf = _classify_sweep_type(p15, bias, candles=ohlc15)
     details["sweep_type"] = sweep_type
-    details["sweep_conf"] = sweep_conf
     if sweep_type == "CONTINUATION":
-        details["filtered"] = "⚠ Sweep continuación (trampa) bloqueado"
         return None
     elif sweep_type == "REVERSA":
         score += int(sweep_conf * 15)
         details["sweep_quality"] = f"✓ Reversa ({sweep_conf:.0%})"
     elif sweep_type == "NEUTRAL" and sweep_conf < 0.5:
-        details["filtered"] = "sweep tipo neutral sin confianza"
         return None
 
-    # 2. BOS / CHOCH — OBLIGATORIO
-    bos, bos_type = detect_bos_scalp(p5, bias)
-    if not bos:
-        fvg_early, fvg_lo, fvg_hi = detect_fvg_scalp(p5, bias, candles=ohlc5)
-        if fvg_early and sweep_type == "REVERSA" and sweep_conf >= 0.6:
-            if fvg_lo <= current_price <= fvg_hi:
-                score += 15 + 5
-                details["entry_type"] = "⚡ EARLY FVG (sin BOS)"
-                details["fvg"] = f"FVG ${fvg_lo}–${fvg_hi}"
-                details["fvg_entry"] = "✓ Precio en FVG"
-                if score < SCORE_EARLY: return None
-                ml_label, ml_prob = get_ml_filter(p5)
-                if ml_label == "LOW": return None
-                if ml_label == "HIGH":
-                    score += 10
-                    details["ml"] = f"ML HIGH ({ml_prob:.0%})"
-                details["score"] = score
-                is_buy = direction == "COMPRAR"
-                tp = current_price + atr * 1.2 if is_buy else current_price - atr * 1.2
-                sl = current_price - atr * 1.0 if is_buy else current_price + atr * 1.0
-                rr      = 1.2
-                session = get_session_name()
-                sig_key = f"EARLY_{direction}_{round(current_price/10)*10}"
-                now = time.time()
-                if sig_key == _last_scalp_signal["key"] and now - _last_scalp_signal["time"] < 600:
-                    return None
-                _last_scalp_signal["key"]   = sig_key
-                _last_scalp_signal["time"]  = now
-                _state._last_any_signal_ts  = now
-                reasons = [f"✔ Sweep REVERSA ({sweep_conf:.0%})", "✔ FVG entry (early)", f"✔ {details.get('ml','')}"]
-                dirstr  = "BUY" if is_buy else "SELL"
-                msg = (
-                    "⚡ *AURUM EARLY ENTRY*\n\n"
-                    "PAIR: XAUUSD\nDIRECTION: " + dirstr + "\n\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "ENTRY:  $" + f"{current_price:.2f}" + "\n"
-                    "SL:     $" + f"{sl:.2f}" + "\n"
-                    "TP:     $" + f"{tp:.2f}" + "\n\n"
-                    "RR:         1:" + str(rr) + "\n"
-                    "CONFIDENCE: " + str(score) + "%\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "REASON:\n" + "\n".join(reasons) + "\n\n"
-                    "SESSION: " + session + "\nMODE: EARLY ⚡"
-                )
-                return {"direction": direction, "score": score, "msg": msg,
-                        "tp": tp, "sl": sl, "rr": rr, "details": details, "session": session}
-        return None
+    # 2. BOS / CHOCH en 15m — OBLIGATORIO
+    bos, bos_type = detect_bos_scalp(p15, bias)
+    if not bos: return None
     score += 25
     details["bos"] = bos_type
-    details["entry_type"] = "STANDARD"
 
-    # 3. FVG
-    fvg, fvg_lo, fvg_hi = detect_fvg_scalp(p5, bias, candles=ohlc5)
+    # 3. FVG en 15m
+    fvg, fvg_lo, fvg_hi = detect_fvg_scalp(p15, bias, candles=ohlc15)
     if fvg:
         score += 15
-        details["fvg"] = f"FVG ${fvg_lo}–${fvg_hi}"
+        details["fvg"] = f"FVG 15M ${fvg_lo}–${fvg_hi}"
         if fvg_lo <= current_price <= fvg_hi:
             score += 5
             details["fvg_entry"] = "✓ Precio en FVG"
 
-    # 4. EMA ALIGNMENT
-    if bias == get_ema_bias(p5):
-        score += 10
-        details["ema"] = "EMA 9/21 alineada"
+    # 4. EMA 15m alineada
+    if bias == get_ema_bias(p15):
+        score += 8
+        details["ema"] = "EMA 9/21 15M alineada"
 
-    # 5. ML FILTER
+    # 5. CONFIRMACIÓN en 5m — OBLIGATORIA para trades reales
+    confirmed_5m = detect_confirmation_candle(p5, bias)
+    if not confirmed_5m:
+        details["filtered"] = "sin confirmación de vela 5M"
+        return None
+    score += 10
+    details["candle"] = "✅ Confirmación 5M"
+
+    # 6. ML FILTER
     ml_label, ml_prob = get_ml_filter(p5, direction=direction)
     if ml_label == "LOW":
-        details["ml_contradiction"] = f"IA contradice — prob={ml_prob:.0%} para {direction}"
         return None
     if ml_label == "HIGH":
         score += 15
         details["ml"] = f"✓ IA confirma {direction} ({ml_prob:.0%})"
     else:
         details["ml"] = f"IA neutral ({ml_prob:.0%})"
-        if score < SCORE_SNIPER - 10: return None
 
-    # DXY CORRELATION
-    dxy_check = check_dxy_correlation(direction)
-    details["dxy"] = dxy_check["note"]
-    if dxy_check["aligned"] is False and score + dxy_check["bonus"] < SCORE_SNIPER:
-        details["filtered"] = f"conflicto DXY — {dxy_check['note']}"
-        return None
-    score += dxy_check["bonus"]
-
-    # US10Y YIELDS
+    # 7. DXY / YIELDS macro
+    dxy_check    = check_dxy_correlation(direction)
     yields_check = check_yields_for_gold(direction)
+    details["dxy"]   = dxy_check["note"]
     details["us10y"] = yields_check["note"]
-    if yields_check["aligned"] is False and score + yields_check["bonus"] < SCORE_SNIPER:
-        details["filtered"] = f"conflicto yields — {yields_check['note']}"
+    if dxy_check["aligned"] is False and yields_check["aligned"] is False:
         return None
-    score += yields_check["bonus"]
+    score += dxy_check["bonus"] + yields_check["bonus"]
     if dxy_check.get("aligned") and yields_check.get("aligned"):
         score += 5
         details["macro_confluence"] = "✓ DXY + US10Y confirman"
+
+    # 8. RSI 15m
+    rsi = get_rsi_scalp(p15)
+    details["rsi"] = round(rsi, 1)
+    if bias == "bullish":
+        if rsi > 78: return None          # sobrecomprado en 15m — no entrar
+        elif rsi < 45: score += 8
+    if bias == "bearish":
+        if rsi < 22: return None          # sobrevendido en 15m
+        elif rsi > 55: score += 8
 
     details["score"] = score
     if score < SCORE_NORMAL: return None
 
     score = int(score * regime_info["score_mult"])
-    details["regime"]      = regime_info["regime"]
-    details["regime_mult"] = regime_info["score_mult"]
+    details["regime"] = regime_info["regime"]
     if score < SCORE_NORMAL: return None
 
-    # RSI SOFT FILTER
-    rsi = get_rsi_scalp(p5)
-    details["rsi"] = round(rsi, 1)
-    if bias == "bullish":
-        if   rsi > 75: score -= 15
-        elif rsi > 65: score -= 5
-        elif rsi < 40: score += 5
-    if bias == "bearish":
-        if   rsi < 25: score -= 15
-        elif rsi < 35: score -= 5
-        elif rsi > 60: score += 5
-    if score < SCORE_NORMAL: return None
-
-    # CANDLE CONFIRMATION
-    if len(p5) >= 4:
-        confirmed = detect_confirmation_candle(p5, bias)
-        details["candle"] = "✅ Confirmación 5M" if confirmed else "⏳ Sin confirmación"
-        if not confirmed and score < 95:
-            details["filtered"] = "sin confirmación de vela 5M"
-            return None
-
-    # COOLDOWN por clave específica
+    # COOLDOWN por clave
     sig_key = f"{direction}_{round(current_price/10)*10}"
     now = time.time()
-    if sig_key == _last_scalp_signal["key"] and now - _last_scalp_signal["time"] < 600:
+    if sig_key == _last_scalp_signal["key"] and now - _last_scalp_signal["time"] < 3600:
         return None
-    _last_scalp_signal["key"]   = sig_key
-    _last_scalp_signal["time"]  = now
-    _state._last_any_signal_ts  = now
+    _last_scalp_signal["key"]  = sig_key
+    _last_scalp_signal["time"] = now
+    _state._last_any_signal_ts = now
 
-    is_buy = direction == "COMPRAR"
-    tp_mult, sl_mult = (2.5, 1.0) if score >= SCORE_SNIPER else (1.5, 1.0)
-    tp  = current_price + atr * tp_mult if is_buy else current_price - atr * tp_mult
-    sl  = current_price - atr * sl_mult if is_buy else current_price + atr * sl_mult
-    rr  = round(tp_mult / sl_mult, 1)
+    is_buy  = direction == "COMPRAR"
+    is_sniper = score >= SCORE_SNIPER
+    # TP/SL basados en ATR 15m — trades reales con R:R mínimo 2.5:1
+    tp_mult = 3.5 if is_sniper else 2.5
+    sl_mult = 1.0
+    tp = current_price + atr_15m * tp_mult if is_buy else current_price - atr_15m * tp_mult
+    sl = current_price - atr_15m * sl_mult if is_buy else current_price + atr_15m * sl_mult
+    rr = round(tp_mult / sl_mult, 1)
+
     session  = get_session_name()
-    mode_tag = "SNIPER 🎯" if score >= SCORE_SNIPER else "NORMAL"
+    mode_tag = "SNIPER 🎯" if is_sniper else "TRADE"
 
     reasons = []
-    if details.get("sweep"): reasons.append("✔ Liquidity Sweep")
-    if details.get("bos"):   reasons.append(f"✔ {details['bos']}")
-    if details.get("fvg"):   reasons.append("✔ FVG entry")
-    if details.get("ema"):   reasons.append("✔ EMA alignment")
-    if details.get("ml"):    reasons.append(f"✔ {details['ml']}")
+    if details.get("htf_4h"):  reasons.append(details["htf_4h"])
+    if details.get("htf_1h"):  reasons.append(details["htf_1h"])
+    if details.get("sweep"):   reasons.append("✔ Liquidity Sweep 15M")
+    if details.get("bos"):     reasons.append(f"✔ {details['bos']}")
+    if details.get("fvg"):     reasons.append("✔ FVG 15M")
+    if details.get("candle"):  reasons.append(details["candle"])
+    if details.get("ml"):      reasons.append(f"✔ {details['ml']}")
+    if details.get("macro_confluence"): reasons.append(details["macro_confluence"])
 
-    header = "🥇 *AURUM SCALP — SNIPER*" if score >= SCORE_SNIPER else "⚡ *AURUM SCALP SIGNAL*"
+    header = "🥇 *AURUM — SNIPER TRADE*" if is_sniper else "📊 *AURUM TRADE SIGNAL*"
     dirstr = "BUY" if is_buy else "SELL"
     msg = (
         header + "\n\nPAIR: XAUUSD\nDIRECTION: " + dirstr + "\n\n"

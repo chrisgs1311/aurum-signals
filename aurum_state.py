@@ -160,7 +160,7 @@ _perf_counters  = {
     "daily_signals": 0, "last_signal_date": "",
 }
 MAX_CONSECUTIVE_LOSSES = 3
-MAX_DAILY_SIGNALS      = 8
+MAX_DAILY_SIGNALS      = 4
 _performance_monitor = {
     "rolling_wr": 0.0, "rolling_pf": 1.0, "rolling_sharpe": 0.0,
     "status": "OK",
@@ -172,10 +172,10 @@ PERF_WINDOW = 50
 PERF_MIN_N  = 20
 
 # ── SCORING THRESHOLDS ────────────────────────────────────
-SCORE_SNIPER        = 88
-SCORE_NORMAL        = 82
-SCORE_EARLY         = 999    # desactivado — causaba señales falsas sin BOS
-SIGNAL_COOLDOWN_SEC = 300    # cooldown global mínimo entre cualquier señal (5 min)
+SCORE_SNIPER        = 92
+SCORE_NORMAL        = 85
+SCORE_EARLY         = 999    # desactivado
+SIGNAL_COOLDOWN_SEC = 3600   # 1 hora entre cualquier señal
 
 # ── MACRO CACHES ─────────────────────────────────────────
 _mtf_cache  = {"prices_1h": [], "last_update": 0}
