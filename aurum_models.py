@@ -130,25 +130,71 @@ class LogisticModel:
 
 
 class DecisionTreeModel:
-    def __init__(self):
-        self.thresholds = {}
-        self.trained = False
+    class _Node:
+        __slots__ = ("feature", "threshold", "left", "right", "value")
+        def __init__(self):
+            self.feature = self.threshold = self.left = self.right = self.value = None
+
+    def __init__(self, max_depth=6, min_samples=10):
+        self.max_depth   = max_depth
+        self.min_samples = min_samples
+        self.root        = None
+        self.trained     = False
+
+    @staticmethod
+    def _gini(y):
+        if not y: return 0.0
+        p = sum(y) / len(y)
+        return 1.0 - p * p - (1.0 - p) * (1.0 - p)
+
+    def _best_split(self, X, y):
+        best_gain = 1e-9; best_feat = None; best_thresh = None
+        n = len(y); pg = self._gini(y)
+        for fi in range(len(X[0])):
+            vals = sorted(set(x[fi] for x in X))
+            if len(vals) < 2: continue
+            thresholds = [(vals[i] + vals[i+1]) * 0.5 for i in range(len(vals)-1)]
+            if len(thresholds) > 20:
+                step = max(1, len(thresholds) // 20)
+                thresholds = thresholds[::step]
+            for t in thresholds:
+                ly = [y[i] for i in range(n) if X[i][fi] <= t]
+                ry = [y[i] for i in range(n) if X[i][fi] >  t]
+                if len(ly) < self.min_samples or len(ry) < self.min_samples: continue
+                gain = pg - (len(ly)/n * self._gini(ly) + len(ry)/n * self._gini(ry))
+                if gain > best_gain:
+                    best_gain = gain; best_feat = fi; best_thresh = t
+        return best_feat, best_thresh
+
+    def _build(self, X, y, depth):
+        node = self._Node()
+        if depth >= self.max_depth or len(y) < self.min_samples * 2:
+            node.value = sum(y) / len(y) if y else 0.5
+            return node
+        feat, thresh = self._best_split(X, y)
+        if feat is None:
+            node.value = sum(y) / len(y)
+            return node
+        node.feature = feat; node.threshold = thresh
+        lm = [i for i in range(len(y)) if X[i][feat] <= thresh]
+        rm = [i for i in range(len(y)) if X[i][feat] >  thresh]
+        node.left  = self._build([X[i] for i in lm], [y[i] for i in lm], depth + 1)
+        node.right = self._build([X[i] for i in rm], [y[i] for i in rm], depth + 1)
+        return node
+
+    def _predict_one(self, node, x):
+        if node.value is not None: return node.value
+        branch = node.left if x[node.feature] <= node.threshold else node.right
+        return self._predict_one(branch, x)
 
     def train(self, X, y):
-        if len(X) < 10: return
-        for fi in range(len(X[0])):
-            vals = [x[fi] for x in X]
-            self.thresholds[fi] = sum(vals) / len(vals)
+        if len(X) < self.min_samples * 2: return
+        self.root    = self._build(X, y, 0)
         self.trained = True
 
     def predict(self, x):
-        if not self.trained: return 0.5
-        score = 0.0
-        weights = [0.15, 0.12, 0.12, 0.08, 0.08, 0.08, 0.08, 0.08, 0.07, 0.07, 0.07]
-        for fi, (thresh, w) in enumerate(zip(self.thresholds.values(), weights)):
-            if fi < len(x):
-                score += w * (1.0 if x[fi] > thresh else 0.0)
-        return score
+        if not self.trained or self.root is None: return 0.5
+        return self._predict_one(self.root, x)
 
 
 class AurumAI:
@@ -182,7 +228,7 @@ class AurumAI:
         data = {
             "logistic_w": self.logistic.w, "logistic_b": self.logistic.b,
             "logistic_trained": self.logistic.trained,
-            "tree_thresh": self.tree.thresholds, "tree_trained": self.tree.trained,
+            "tree_root": self.tree.root, "tree_trained": self.tree.trained,
             "trained": self.trained, "accuracy": self.accuracy,
             "epochs": self.epochs, "drift_score": self.drift_score,
             "accuracy_by_hour": self.accuracy_by_hour, "accuracy_by_dow": self.accuracy_by_dow,
@@ -211,8 +257,8 @@ class AurumAI:
                     self.logistic.w.extend([0.0] * (11 - len(self.logistic.w)))
                 self.logistic.b        = d.get("logistic_b", 0.0)
                 self.logistic.trained  = d.get("logistic_trained", False)
-                self.tree.thresholds   = d.get("tree_thresh", {})
-                self.tree.trained      = d.get("tree_trained", False)
+                self.tree.root         = d.get("tree_root", None)
+                self.tree.trained      = d.get("tree_trained", False) and self.tree.root is not None
                 self.trained           = d.get("trained", False)
                 self.accuracy          = d.get("accuracy", 0.0)
                 self.epochs            = d.get("epochs", 0)
@@ -372,9 +418,8 @@ class AurumAI:
         ema_cross = max(-1, min(1, (e9-e21)/(e21+1e-9)*100))
         e12, e26 = ema(p,12), ema(p,26)
         macd_norm = max(-1, min(1, (e12-e26)/(p[-1]*0.01+1e-9)))
-        atrs = [max(p[i]*1.004-p[i]*0.996, abs(p[i]*1.004-p[i-1]), abs(p[i]*0.996-p[i-1]))
-                for i in range(len(p)-14, len(p))]
-        atr_val = sum(atrs)/14
+        atrs    = [abs(p[i] - p[i-1]) for i in range(len(p)-14, len(p))]
+        atr_val = sum(atrs) / 14
         atr_norm = max(0, min(2, atr_val/(p[-1]*0.01+1e-9)))
         sma20 = sum(p[-20:])/20
         pvs   = max(-2, min(2, (p[-1]-sma20)/(sma20+1e-9)*100))
@@ -392,24 +437,49 @@ class AurumAI:
                 max(0, min(2, vol)), hour_norm, dow_norm, vol_rel]
 
     def detect_drift(self):
-        if len(self.recent_errors) < 10: return 0.0
-        self.drift_score = sum(self.recent_errors[-10:]) / 10
+        if len(self.recent_errors) < 20: return 0.0
+        window  = self.recent_errors[-30:]
+        n       = len(window)
+        weights = [math.exp(0.1 * i) for i in range(n)]
+        w_sum   = sum(weights)
+        self.drift_score = sum(w * e for w, e in zip(weights, window)) / w_sum
         return self.drift_score
 
     def is_market_drifting(self):
         return self.detect_drift() > 0.65
 
+    @staticmethod
+    def _label_with_sl_tp(prices, i, lookahead=10, tp_pct=0.0015, sl_pct=0.001):
+        entry = prices[i]
+        tp = entry * (1.0 + tp_pct)
+        sl = entry * (1.0 - sl_pct)
+        for j in range(i + 1, min(i + lookahead + 1, len(prices))):
+            if prices[j] >= tp: return 1
+            if prices[j] <= sl: return 0
+        return 1 if prices[min(i + lookahead, len(prices) - 1)] > entry else 0
+
+    @staticmethod
+    def _balance_classes(X, y):
+        pos = [i for i, v in enumerate(y) if v == 1]
+        neg = [i for i, v in enumerate(y) if v == 0]
+        if not pos or not neg: return X, y
+        minority, majority = (pos, neg) if len(pos) < len(neg) else (neg, pos)
+        diff = len(majority) - len(minority)
+        if diff <= 0: return X, y
+        extra = [minority[i % len(minority)] for i in range(diff)]
+        all_idx = list(range(len(y))) + extra
+        return [X[i] for i in all_idx], [y[i] for i in all_idx]
+
     def train(self, prices):
         if len(prices) < 60: return False
         now = _dt.datetime.utcnow()
         X, y, hours, dows = [], [], [], []
-        for i in range(40, len(prices)-5):
-            mins_ago = (len(prices)-i)*5
+        for i in range(40, len(prices) - 12):
+            mins_ago = (len(prices) - i) * 5
             t = now - _dt.timedelta(minutes=mins_ago)
             features = self.extract_features(prices[i-35:i], hour=t.hour, dow=t.weekday())
             if not features: continue
-            future_ret = (prices[i+4]-prices[i])/prices[i]
-            label = 1 if future_ret > 0.0005 else 0
+            label = self._label_with_sl_tp(prices, i, lookahead=10, tp_pct=0.0015, sl_pct=0.001)
             X.append(features); y.append(label)
             hours.append(t.hour); dows.append(t.weekday())
         if len(X) < 30: return False
@@ -417,8 +487,10 @@ class AurumAI:
         X_train, y_train = X[:split], y[:split]
         X_val,   y_val   = X[split:], y[split:]
         h_val, d_val     = hours[split:], dows[split:]
-        self.logistic.train(X_train, y_train)
-        self.tree.train(X_train, y_train)
+        X_train_b, y_train_b = self._balance_classes(X_train, y_train)
+        self.logistic.train(X_train_b, y_train_b)
+        self.tree.train(X_train_b, y_train_b)
+        self.save_dataset(X_train, y_train)
         correct = 0
         for xi,yi,h,dow in zip(X_val,y_val,h_val,d_val):
             p_ens = 0.6*self.logistic.predict(xi) + 0.4*self.tree.predict(xi)
