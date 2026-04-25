@@ -416,16 +416,142 @@ _ict_prices_5m  = _scalp_prices_5m
 _ict_prices_15m = _scalp_prices_15m
 
 
+# ── ICT ORDER BLOCKS ─────────────────────────────────────
+def detect_order_block(candles, bias, atr):
+    """Último candle opuesto antes de un displacement. Zona institucional de entrada."""
+    if len(candles) < 15 or atr <= 0: return False, 0, 0, 0
+    if bias == "bullish":
+        for i in range(len(candles)-4, max(2, len(candles)-30), -1):
+            c = candles[i]
+            if c["c"] >= c["o"]: continue
+            after = candles[i+1:min(i+6, len(candles))]
+            if len(after) < 2: continue
+            up_move = max(a["h"] for a in after) - c["l"]
+            if up_move < atr * 1.5: continue
+            if any(x["c"] < c["l"] for x in candles[i+1:]): continue
+            return True, round(c["h"], 2), round(c["l"], 2), round(min(1.0, up_move/(atr*4)), 2)
+    if bias == "bearish":
+        for i in range(len(candles)-4, max(2, len(candles)-30), -1):
+            c = candles[i]
+            if c["c"] <= c["o"]: continue
+            after = candles[i+1:min(i+6, len(candles))]
+            if len(after) < 2: continue
+            dn_move = c["h"] - min(a["l"] for a in after)
+            if dn_move < atr * 1.5: continue
+            if any(x["c"] > c["h"] for x in candles[i+1:]): continue
+            return True, round(c["h"], 2), round(c["l"], 2), round(min(1.0, dn_move/(atr*4)), 2)
+    return False, 0, 0, 0
+
+
+# ── OPTIMAL TRADE ENTRY — Fibonacci 61.8–78.6% ───────────
+def detect_ote(candles, bias, current_price):
+    """Zona óptima de entrada: retroceso del 61.8% al 78.6% del impulso."""
+    if len(candles) < 15: return False, 0, 0
+    prices = [c["c"] for c in candles[-30:]]
+    lows   = _swing_lows(prices, n=3)
+    highs  = _swing_highs(prices, n=3)
+    if not lows or not highs: return False, 0, 0
+    sl, sh = lows[-1][1], highs[-1][1]
+    if sh <= sl or (sh - sl) < prices[-1] * 0.002: return False, 0, 0
+    imp = sh - sl
+    if bias == "bullish":
+        lo, hi = sh - imp * 0.786, sh - imp * 0.618
+    else:
+        lo, hi = sl + imp * 0.618, sl + imp * 0.786
+    return lo <= current_price <= hi, round(lo, 2), round(hi, 2)
+
+
+# ── DISPLACEMENT — huella institucional ──────────────────
+def detect_displacement(candles, bias, atr):
+    """Vela de impulso fuerte (body > 1.5 ATR, wick ratio > 60%)."""
+    if len(candles) < 5 or atr <= 0: return False
+    for c in candles[-6:]:
+        body = abs(c["c"] - c["o"])
+        if body < atr * 1.5: continue
+        if body / (c["h"] - c["l"] + 1e-9) < 0.6: continue
+        if bias == "bullish" and c["c"] > c["o"]: return True
+        if bias == "bearish" and c["c"] < c["o"]: return True
+    return False
+
+
+# ── EQUAL HIGHS / EQUAL LOWS — pools de liquidez ─────────
+def detect_equal_levels(candles, bias, tol=0.0004):
+    """EQH / EQL: niveles casi iguales que acumulan liquidez."""
+    if len(candles) < 10: return False, 0
+    if bias == "bullish":
+        lows = sorted([c["l"] for c in candles[-20:]])
+        for i in range(len(lows)-1):
+            if abs(lows[i]-lows[i+1])/(lows[i]+1e-9) < tol:
+                return True, round((lows[i]+lows[i+1])/2, 2)
+    if bias == "bearish":
+        highs = sorted([c["h"] for c in candles[-20:]], reverse=True)
+        for i in range(len(highs)-1):
+            if abs(highs[i]-highs[i+1])/(highs[i]+1e-9) < tol:
+                return True, round((highs[i]+highs[i+1])/2, 2)
+    return False, 0
+
+
+# ── ICT KILLZONES ─────────────────────────────────────────
+def get_killzone():
+    """Ventanas de mayor probabilidad según ICT."""
+    t = _dt.datetime.utcnow()
+    m = t.hour * 60 + t.minute
+    if 480 <= m <= 570: return True, "London Open 🇬🇧", 20
+    if 780 <= m <= 840: return True, "New York Open 🇺🇸", 18
+    if 600 <= m <= 660: return True, "London Close",    10
+    if 900 <= m <= 960: return True, "NY PM",           10
+    return False, "", 0
+
+
+# ── INDUCEMENT ────────────────────────────────────────────
+def detect_inducement(candles, bias):
+    """Swing menor barrido antes del movimiento real — confirma manipulación."""
+    if len(candles) < 15: return False
+    prices = [c["c"] for c in candles]
+    if bias == "bullish":
+        minor = _swing_highs(prices[-15:-5], n=1)
+        if minor and max(prices[-5:]) > minor[-1][1]: return True
+    if bias == "bearish":
+        minor = _swing_lows(prices[-15:-5], n=1)
+        if minor and min(prices[-5:]) < minor[-1][1]: return True
+    return False
+
+
+# ── SMART TP — siguiente pool de liquidez ─────────────────
+def find_liquidity_target(candles, bias, entry, atr_15m):
+    """Apunta el TP al siguiente swing H/L o EQH/EQL en lugar de múltiplo fijo."""
+    prices = [c["c"] for c in candles]
+    if bias == "bullish":
+        candidates = [h for _, h in _swing_highs(prices, n=2) if h > entry + atr_15m * 0.8]
+        highs_raw  = [c["h"] for c in candles]
+        for i in range(len(highs_raw)):
+            for j in range(i+3, min(i+15, len(highs_raw))):
+                if abs(highs_raw[i]-highs_raw[j])/(highs_raw[i]+1e-9) < 0.0005:
+                    lv = (highs_raw[i]+highs_raw[j])/2
+                    if lv > entry + atr_15m: candidates.append(lv)
+        if candidates: return round(min(candidates), 2), "SWING HIGH"
+        return round(entry + atr_15m * 3.0, 2), "ATR 3x"
+    if bias == "bearish":
+        candidates = [l for _, l in _swing_lows(prices, n=2) if l < entry - atr_15m * 0.8]
+        lows_raw   = [c["l"] for c in candles]
+        for i in range(len(lows_raw)):
+            for j in range(i+3, min(i+15, len(lows_raw))):
+                if abs(lows_raw[i]-lows_raw[j])/(lows_raw[i]+1e-9) < 0.0005:
+                    lv = (lows_raw[i]+lows_raw[j])/2
+                    if lv < entry - atr_15m: candidates.append(lv)
+        if candidates: return round(max(candidates), 2), "SWING LOW"
+        return round(entry - atr_15m * 3.0, 2), "ATR 3x"
+    return round(entry + atr_15m * 2.5, 2), "ATR 2.5x"
+
+
 # ── MAIN SIGNAL ENGINE ────────────────────────────────────
 def run_ict_engine(current_price, atr):
-    """AURUM TRADE v7.0 — Trades reales en 15m. Estructura ICT con confluencia HTF."""
+    """AURUM TRADE v8.0 — ICT completo: OB, OTE, Displacement, Killzones, Smart TP."""
     if len(_ohlc_candles_5m) < 20:  return None
     if len(_ohlc_candles_15m) < 20: return None
 
-    # Cooldown global: mínimo 1 hora entre señales
     now_g = time.time()
-    if now_g - _state._last_any_signal_ts < SIGNAL_COOLDOWN_SEC:
-        return None
+    if now_g - _state._last_any_signal_ts < SIGNAL_COOLDOWN_SEC: return None
 
     ohlc5  = list(_ohlc_candles_5m)
     ohlc15 = list(_ohlc_candles_15m)
@@ -436,121 +562,148 @@ def run_ict_engine(current_price, atr):
 
     if not is_trading_session(): return None
 
-    # Régimen basado en 15m — mercados laterales o extremos no se tradean
     regime_info = detect_market_regime(p15)
     if not regime_info["should_trade"]: return None
 
-    # ATR real de 15m — stops y targets de trade real (no scalp)
     atr_15m = sum(abs(ohlc15[i]["c"] - ohlc15[i-1]["c"])
                   for i in range(len(ohlc15)-14, len(ohlc15))) / 14
     if atr_15m <= 0: atr_15m = atr * 3
 
-    # Multi-timeframe: bias 15m es obligatorio, HTF suma puntos
     bias_15m = get_ema_bias(p15)
     if not bias_15m: return None
+
+    bias_5m = get_ema_bias(p5)
+    if bias_5m and bias_5m != bias_15m: return None
 
     with _data_lock:
         ohlc4h = list(_live_cache.get("ohlc_4h", []))
         ohlc1h = list(_live_cache.get("ohlc_1h", []))
-    mtf_bias_4h = get_ema_bias([c["close"] for c in ohlc4h]) if len(ohlc4h) >= 21 else None
-    mtf_bias_1h = get_ema_bias([c["close"] for c in ohlc1h]) if len(ohlc1h) >= 21 else None
-
-    # 15m debe coincidir con 5m — sin divergencia intra-timeframe
-    bias_5m = get_ema_bias(p5)
-    if bias_5m and bias_5m != bias_15m: return None
+    mtf_4h = get_ema_bias([c["close"] for c in ohlc4h]) if len(ohlc4h) >= 21 else None
+    mtf_1h = get_ema_bias([c["close"] for c in ohlc1h]) if len(ohlc1h) >= 21 else None
 
     bias      = bias_15m
     direction = "COMPRAR" if bias == "bullish" else "VENDER"
     score     = 0
-    details   = {"bias": bias, "direction": direction, "tf": "15M"}
+    details   = {"bias": bias, "direction": direction, "tf": "15M", "ver": "v8.0"}
 
-    # HTF alignment bonus (no bloquea, pero suma al score)
-    htf_aligned = 0
-    if mtf_bias_4h == bias: htf_aligned += 1; score += 10; details["htf_4h"] = "✓ 4H alineado"
-    if mtf_bias_1h == bias: htf_aligned += 1; score += 8;  details["htf_1h"] = "✓ 1H alineado"
+    # 0. KILLZONE — ventana de mayor probabilidad ICT
+    in_kz, kz_name, kz_pts = get_killzone()
+    if in_kz:
+        score += kz_pts
+        details["killzone"] = f"✓ {kz_name}"
+
+    # 1. HTF confluence
+    htf_count = 0
+    if mtf_4h == bias: htf_count += 1; score += 12; details["htf_4h"] = "✓ 4H"
+    if mtf_1h == bias: htf_count += 1; score += 10; details["htf_1h"] = "✓ 1H"
+    if htf_count == 2: score += 8; details["htf_full"] = "✓ HTF completo"
 
     detect_pre_signal(p15, candles=ohlc15)
 
-    # 1. LIQUIDITY SWEEP en 15m — OBLIGATORIO
+    # 2. DISPLACEMENT — obligatorio para confirmar presencia institucional
+    displaced = detect_displacement(ohlc15, bias, atr_15m)
+    if not displaced: return None
+    score += 15
+    details["displacement"] = "✓ Displacement"
+
+    # 3. LIQUIDITY SWEEP en 15m — OBLIGATORIO
     swept, sweep_level, rejection = detect_sweep_and_rejection(p15, bias, candles=ohlc15)
     if not swept: return None
-    if not _is_real_sweep(p15, sweep_level, bias, candles=ohlc15, atr=atr_15m):
-        return None
-    score += 40
-    details["sweep"] = f"Sweep 15M ${sweep_level} | rej={rejection:.1f}"
+    if not _is_real_sweep(p15, sweep_level, bias, candles=ohlc15, atr=atr_15m): return None
+    score += 35
+    details["sweep"] = f"Sweep ${sweep_level}"
 
     sweep_type, sweep_conf = _classify_sweep_type(p15, bias, candles=ohlc15)
-    details["sweep_type"] = sweep_type
-    if sweep_type == "CONTINUATION":
-        return None
+    if sweep_type == "CONTINUATION": return None
     elif sweep_type == "REVERSA":
-        score += int(sweep_conf * 15)
-        details["sweep_quality"] = f"✓ Reversa ({sweep_conf:.0%})"
-    elif sweep_type == "NEUTRAL" and sweep_conf < 0.5:
-        return None
+        score += int(sweep_conf * 12)
+        details["sweep_q"] = f"Reversa {sweep_conf:.0%}"
+    elif sweep_type == "NEUTRAL" and sweep_conf < 0.5: return None
 
-    # 2. BOS / CHOCH en 15m — OBLIGATORIO
+    # 4. BOS / CHOCH en 15m — OBLIGATORIO
     bos, bos_type = detect_bos_scalp(p15, bias)
     if not bos: return None
-    score += 25
+    score += 30
     details["bos"] = bos_type
 
-    # 3. FVG en 15m
+    # 5. INDUCEMENT — confirma la narrativa de manipulación
+    if detect_inducement(ohlc15, bias):
+        score += 12
+        details["inducement"] = "✓ Inducement"
+
+    # 6. ORDER BLOCK — zona de entrada institucional
+    ob_found, ob_hi, ob_lo, ob_str = detect_order_block(ohlc15, bias, atr_15m)
+    if ob_found:
+        score += 20
+        details["ob"] = f"OB ${ob_lo}–${ob_hi}"
+        if ob_lo <= current_price <= ob_hi:
+            score += 20
+            details["ob_entry"] = "✓ En Order Block"
+
+    # 7. OTE — Fibonacci 61.8–78.6%
+    in_ote, ote_lo, ote_hi = detect_ote(ohlc15, bias, current_price)
+    if in_ote:
+        score += 15
+        details["ote"] = f"✓ OTE ${ote_lo}–${ote_hi}"
+
+    # 8. FVG en 15m
     fvg, fvg_lo, fvg_hi = detect_fvg_scalp(p15, bias, candles=ohlc15)
     if fvg:
-        score += 15
-        details["fvg"] = f"FVG 15M ${fvg_lo}–${fvg_hi}"
+        score += 12
+        details["fvg"] = f"FVG ${fvg_lo}–${fvg_hi}"
         if fvg_lo <= current_price <= fvg_hi:
-            score += 5
-            details["fvg_entry"] = "✓ Precio en FVG"
+            score += 8
+            details["fvg_entry"] = "✓ En FVG"
 
-    # 4. EMA 15m alineada
+    # 9. EQH / EQL — target de liquidez visible
+    eq_found, eq_level = detect_equal_levels(ohlc15, bias)
+    if eq_found:
+        score += 8
+        details["eq"] = f"{'EQH' if bias=='bearish' else 'EQL'} ${eq_level}"
+
+    # 10. EMA 15m alineada
     if bias == get_ema_bias(p15):
         score += 8
-        details["ema"] = "EMA 9/21 15M alineada"
+        details["ema"] = "EMA 9/21 15M"
 
-    # 5. CONFIRMACIÓN en 5m — OBLIGATORIA para trades reales
-    confirmed_5m = detect_confirmation_candle(p5, bias)
-    if not confirmed_5m:
-        details["filtered"] = "sin confirmación de vela 5M"
-        return None
+    # Filtro intermedio — no continuar si la estructura es débil
+    if score < SCORE_NORMAL - 20: return None
+
+    # 11. CONFIRMACIÓN en 5m — OBLIGATORIA
+    if not detect_confirmation_candle(p5, bias): return None
     score += 10
     details["candle"] = "✅ Confirmación 5M"
 
-    # 6. ML FILTER
+    # 12. RSI 15m
+    rsi = get_rsi_scalp(p15)
+    details["rsi"] = round(rsi, 1)
+    if bias == "bullish":
+        if rsi > 78: return None
+        elif rsi < 40: score += 8
+        elif rsi > 65: score -= 5
+    if bias == "bearish":
+        if rsi < 22: return None
+        elif rsi > 60: score += 8
+        elif rsi < 35: score -= 5
+
+    # 13. ML FILTER
     ml_label, ml_prob = get_ml_filter(p5, direction=direction)
-    if ml_label == "LOW":
-        return None
+    if ml_label == "LOW": return None
     if ml_label == "HIGH":
         score += 15
-        details["ml"] = f"✓ IA confirma {direction} ({ml_prob:.0%})"
+        details["ml"] = f"✓ IA ({ml_prob:.0%})"
     else:
         details["ml"] = f"IA neutral ({ml_prob:.0%})"
 
-    # 7. DXY / YIELDS macro
+    # 14. MACRO — DXY + US10Y
     dxy_check    = check_dxy_correlation(direction)
     yields_check = check_yields_for_gold(direction)
     details["dxy"]   = dxy_check["note"]
     details["us10y"] = yields_check["note"]
-    if dxy_check["aligned"] is False and yields_check["aligned"] is False:
-        return None
+    if dxy_check["aligned"] is False and yields_check["aligned"] is False: return None
     score += dxy_check["bonus"] + yields_check["bonus"]
     if dxy_check.get("aligned") and yields_check.get("aligned"):
-        score += 5
-        details["macro_confluence"] = "✓ DXY + US10Y confirman"
-
-    # 8. RSI 15m
-    rsi = get_rsi_scalp(p15)
-    details["rsi"] = round(rsi, 1)
-    if bias == "bullish":
-        if rsi > 78: return None          # sobrecomprado en 15m — no entrar
-        elif rsi < 45: score += 8
-    if bias == "bearish":
-        if rsi < 22: return None          # sobrevendido en 15m
-        elif rsi > 55: score += 8
-
-    details["score"] = score
-    if score < SCORE_NORMAL: return None
+        score += 5; details["macro"] = "✓ DXY+Yields"
 
     score = int(score * regime_info["score_mult"])
     details["regime"] = regime_info["regime"]
@@ -565,42 +718,52 @@ def run_ict_engine(current_price, atr):
     _last_scalp_signal["time"] = now
     _state._last_any_signal_ts = now
 
-    is_buy  = direction == "COMPRAR"
+    is_buy    = direction == "COMPRAR"
     is_sniper = score >= SCORE_SNIPER
-    # TP/SL basados en ATR 15m — trades reales con R:R mínimo 2.5:1
-    tp_mult = 3.5 if is_sniper else 2.5
-    sl_mult = 1.0
-    tp = current_price + atr_15m * tp_mult if is_buy else current_price - atr_15m * tp_mult
-    sl = current_price - atr_15m * sl_mult if is_buy else current_price + atr_15m * sl_mult
-    rr = round(tp_mult / sl_mult, 1)
+
+    # TP inteligente — siguiente pool de liquidez
+    tp_smart, tp_label = find_liquidity_target(ohlc15, bias, current_price, atr_15m)
+    sl = current_price - atr_15m if is_buy else current_price + atr_15m
+    rr_real = abs(tp_smart - current_price) / (abs(sl - current_price) + 1e-9)
+    if rr_real < 2.0:
+        tp_mult  = 3.5 if is_sniper else 2.5
+        tp_smart = current_price + atr_15m * tp_mult if is_buy else current_price - atr_15m * tp_mult
+        rr_real  = tp_mult
+        tp_label = f"ATR {tp_mult}x"
+    rr = round(rr_real, 1)
 
     session  = get_session_name()
     mode_tag = "SNIPER 🎯" if is_sniper else "TRADE"
 
     reasons = []
-    if details.get("htf_4h"):  reasons.append(details["htf_4h"])
-    if details.get("htf_1h"):  reasons.append(details["htf_1h"])
-    if details.get("sweep"):   reasons.append("✔ Liquidity Sweep 15M")
-    if details.get("bos"):     reasons.append(f"✔ {details['bos']}")
-    if details.get("fvg"):     reasons.append("✔ FVG 15M")
-    if details.get("candle"):  reasons.append(details["candle"])
-    if details.get("ml"):      reasons.append(f"✔ {details['ml']}")
-    if details.get("macro_confluence"): reasons.append(details["macro_confluence"])
+    if details.get("killzone"):   reasons.append(f"✔ {kz_name}")
+    if details.get("htf_full"):   reasons.append("✔ 4H + 1H confluencia")
+    elif details.get("htf_4h"):   reasons.append("✔ 4H alineado")
+    reasons.append("✔ Displacement institucional")
+    reasons.append(f"✔ Liquidity Sweep ({sweep_type})")
+    reasons.append(f"✔ {bos_type}")
+    if details.get("inducement"): reasons.append("✔ Inducement")
+    if details.get("ob_entry"):   reasons.append(f"✔ Order Block ${ob_lo}–${ob_hi}")
+    elif details.get("ob"):       reasons.append(f"✔ OB detectado")
+    if details.get("ote"):        reasons.append(details["ote"])
+    if details.get("fvg_entry"):  reasons.append(f"✔ FVG entry ${fvg_lo}–${fvg_hi}")
+    elif details.get("fvg"):      reasons.append("✔ FVG presente")
+    if details.get("ml"):         reasons.append(f"✔ {details['ml']}")
+    if details.get("macro"):      reasons.append("✔ DXY + Yields")
 
-    header = "🥇 *AURUM — SNIPER TRADE*" if is_sniper else "📊 *AURUM TRADE SIGNAL*"
+    header = "🥇 *AURUM — SNIPER*" if is_sniper else "📊 *AURUM TRADE*"
     dirstr = "BUY" if is_buy else "SELL"
     msg = (
         header + "\n\nPAIR: XAUUSD\nDIRECTION: " + dirstr + "\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "ENTRY:  $" + f"{current_price:.2f}" + "\n"
         "SL:     $" + f"{sl:.2f}" + "\n"
-        "TP:     $" + f"{tp:.2f}" + "\n\n"
+        "TP:     $" + f"{tp_smart:.2f}" + "  (" + tp_label + ")\n\n"
         "RR:         1:" + str(rr) + "\n"
         "CONFIDENCE: " + str(score) + "%\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "REASON:\n" + "\n".join(reasons) + "\n\n"
         "SESSION: " + session + "\nMODE: " + mode_tag
     )
-
     return {"direction": direction, "score": score, "msg": msg,
-            "tp": tp, "sl": sl, "rr": rr, "details": details, "session": session}
+            "tp": tp_smart, "sl": sl, "rr": rr, "details": details, "session": session}

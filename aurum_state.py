@@ -172,8 +172,8 @@ PERF_WINDOW = 50
 PERF_MIN_N  = 20
 
 # ── SCORING THRESHOLDS ────────────────────────────────────
-SCORE_SNIPER        = 92
-SCORE_NORMAL        = 85
+SCORE_SNIPER        = 165
+SCORE_NORMAL        = 125
 SCORE_EARLY         = 999    # desactivado
 SIGNAL_COOLDOWN_SEC = 3600   # 1 hora entre cualquier señal
 
