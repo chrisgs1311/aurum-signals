@@ -7,7 +7,7 @@ Output: aurum_backtest_report.html + aurum_backtest_data.json
 import urllib.request, json, math, os, time
 from datetime import datetime, timezone
 
-API_KEY = os.environ.get("TWELVE_API_KEY", "dd53883de1a84cccaf65bf7f4e7a4756")
+API_KEY = os.environ.get("TWELVE_API_KEY", "")
 
 def fetch_candles(interval, size=500):
     print(f"  Descargando {size} velas {interval}...")
