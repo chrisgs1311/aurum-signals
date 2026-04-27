@@ -43,22 +43,29 @@ _ict_prices_15m = _scalp_prices_15m
 # v6.4: URLs de precio — Massive PRIMERO (si hay key), luego gold-api, luego Twelve Data
 # Massive da el mismo feed que TradingView Forex.com con unlimited calls
 def _parse_massive_price(d):
-    """Parse respuesta de Massive /v2/last/nbbo/C:XAUUSD.
-    Formato: {results: {B: bid, A: ask, ...}}"""
+    """Parse respuesta de Massive snapshot forex.
+    Formato snapshot: {status:"OK", ticker:{day:{c:..}, lastQuote:{a:bid,b:ask,...}}}"""
     if not d or d.get("status") != "OK": return None
-    r = d.get("results", {})
-    bid = r.get("b") or r.get("B")  # bid
-    ask = r.get("a") or r.get("A")  # ask
+    # Snapshot endpoint
+    t = d.get("ticker", {})
+    lq = t.get("lastQuote", {})
+    bid = lq.get("b") or lq.get("B")
+    ask = lq.get("a") or lq.get("A")
     if bid and ask:
         mid = (float(bid) + float(ask)) / 2
         return {"price": mid, "ch": 0, "chp": 0, "bid": float(bid), "ask": float(ask)}
+    # Fallback: last trade
+    lt = t.get("lastTrade", {})
+    p = lt.get("p") or lt.get("P")
+    if p:
+        return {"price": float(p), "ch": 0, "chp": 0}
     return None
 
 _PRICE_APIS = []
 if MASSIVE_API_KEY:
-    # Primario: Massive NBBO quote (bid/ask mid price, mismo feed que TradingView)
+    # Primario: Massive snapshot forex (equivalente Polygon /v2/snapshot)
     _PRICE_APIS.append((
-        f"https://api.massive.com/v2/last/nbbo/C:XAUUSD?apikey={MASSIVE_API_KEY}",
+        f"https://api.massive.com/v2/snapshot/locale/global/markets/forex/tickers/C:XAUUSD?apikey={MASSIVE_API_KEY}",
         _parse_massive_price,
     ))
 
@@ -109,8 +116,8 @@ def _worker_price():
 
             if result and result["price"] > 0:
                 # Calcular ch/chp desde precio anterior — no depender del API
-                prev = _live_cache.get("price", {})
-                prev_p = prev.get("price", 0) if prev else 0
+                prev = _live_cache.get("price")
+                prev_p = prev.get("price", 0) if isinstance(prev, dict) else 0
                 if prev_p > 0 and prev_p != result["price"]:
                     ch  = round(result["price"] - prev_p, 2)
                     chp = round(ch / prev_p * 100, 4)
@@ -120,12 +127,12 @@ def _worker_price():
                     result["ch"]  = prev.get("ch",  0)
                     result["chp"] = prev.get("chp", 0)
 
-                if not ws_healthy or ws_age > 3:
-                    _live_cache["price"]      = result
-                    _live_cache["price_ts"]   = time.time()
-                    _live_cache["price_fails"] = 0
-                    push_price(result["price"])
-                    _push_sse("price", result)
+                # Siempre actualizar — WS y HTTP coexisten (más updates = mejor)
+                _live_cache["price"]      = result
+                _live_cache["price_ts"]   = time.time()
+                _live_cache["price_fails"] = 0
+                push_price(result["price"])
+                _push_sse("price", result)
             else:
                 _live_cache["price_fails"] = _live_cache.get("price_fails", 0) + 1
                 if _live_cache["price_fails"] >= 3:
