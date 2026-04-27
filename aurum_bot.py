@@ -284,16 +284,13 @@ def _worker_websocket_massive():
             
             print("  ✅ Massive WebSocket autenticado")
             
-            # Subscribe: formato CORRECTO Massive WebSocket forex
-            # Docs: {from}-{to} format → XAU-USD
-            # C. = Quotes channel, CAS. = Per-second aggregates, CA. = Per-minute aggregates
-            # Probamos con ambos formatos de XAU por si acaso
+            # Formato Massive/Polygon: CHANNEL:TICKER (igual que REST: C:XAUUSD)
             sub_msg = json.dumps({
                 "action": "subscribe",
-                "params": "C.XAU-USD,CAS.XAU-USD,CA.XAU-USD"
+                "params": "C:XAUUSD,CAS:XAUUSD,CA:XAUUSD"
             })
             _ws_send_frame(sock, sub_msg)
-            print("  ✅ Subscribed XAU-USD (quotes + per-second + per-minute bars)")
+            print("  ✅ Subscribed C:XAUUSD (quotes + per-second + per-minute)")
             
             _live_cache["ws_active"] = True
             _live_cache["ws_provider"] = "massive"
