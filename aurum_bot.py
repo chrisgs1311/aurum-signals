@@ -333,7 +333,8 @@ def _worker_websocket_massive():
                             print(f"  📡 Massive status: {ev.get('message', str(ev))[:150]}")
                         
                         if last_price > 0:
-                            prev = _live_cache.get("price", {}).get("price", last_price)
+                            _prev_data = _live_cache.get("price")
+                            prev = _prev_data.get("price", last_price) if isinstance(_prev_data, dict) else last_price
                             ch = last_price - prev if prev else 0
                             chp = (ch / prev * 100) if prev else 0
                             result = {"price": last_price, "ch": round(ch, 2), "chp": round(chp, 3)}
@@ -394,7 +395,8 @@ def _worker_websocket():
                     if data.get("event") == "price" and "price" in data:
                         price = float(data["price"])
                         if price > 0:
-                            prev = _live_cache.get("price", {}).get("price", price)
+                            _prev_data = _live_cache.get("price")
+                            prev = _prev_data.get("price", price) if isinstance(_prev_data, dict) else price
                             ch = price - prev if prev else 0
                             chp = (ch / prev * 100) if prev else 0
                             result = {"price": price, "ch": round(ch, 2), "chp": round(chp, 3)}
