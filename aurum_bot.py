@@ -93,9 +93,9 @@ def _worker_price():
             ws_healthy = ws_active and ws_age < 10
 
             if MASSIVE_API_KEY:
-                sleep_time = 2
+                sleep_time = 1
             else:
-                sleep_time = 30 if ws_healthy else 5
+                sleep_time = 5 if not ws_healthy else 15
 
             url, parser = _PRICE_APIS[api_idx]
             if "twelvedata.com" in url and not _can_call_twelve():
