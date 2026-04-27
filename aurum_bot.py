@@ -84,38 +84,45 @@ else:
     print(f"  ⚠ Sin MASSIVE_API_KEY — usando gold-api como primario")
 
 def _worker_price():
-    """Worker #1: precio cada 1s vía HTTP (FALLBACK del WebSocket).
-    Si el WebSocket está activo, este worker reduce frecuencia automáticamente.
-    v6.2: NO alimenta buffers SCALP (evita velas falsas), solo display + ML.
-    v6.2: usa Twelve Data REST primero (~20s cuando WS activo, ~5s cuando WS caído).
-    Cálculo: 5s = 17,280 calls/día (EXCESIVO), 20s = 4,320 calls/día (tampoco).
-    Solución: si WS activo, usa HTTP cada 30s (solo validación). Si WS caído, cada 5s."""
+    """Worker #1: precio vía HTTP. Agresivo si WS silent > 10s."""
     api_idx = 0
     while True:
         try:
-            ws_active = _live_cache.get("ws_active", False)
-            # v6.4: con Massive unlimited calls, podemos ser agresivos
-            # Massive unlimited → 1s siempre (86,400 calls/día sin límite)
-            # Twelve Data (fallback) → 30s si WS activo, 5s si WS caído
+            ws_active  = _live_cache.get("ws_active", False)
+            ws_age     = time.time() - _live_cache.get("ws_last_tick", 0)
+            ws_healthy = ws_active and ws_age < 10
+
             if MASSIVE_API_KEY:
-                sleep_time = 1  # Massive unlimited, no hay miedo
+                sleep_time = 2
             else:
-                sleep_time = 30 if ws_active else 5
+                sleep_time = 30 if ws_healthy else 5
+
             url, parser = _PRICE_APIS[api_idx]
-            # Si vamos a llamar a Twelve Data, checar límite diario
             if "twelvedata.com" in url and not _can_call_twelve():
                 api_idx = (api_idx + 1) % len(_PRICE_APIS)
                 url, parser = _PRICE_APIS[api_idx]
+
             d = _fetch_with_retry(url, timeout=5, retries=1, backoff=0.5)
             if "twelvedata.com" in url:
                 _count_api_call("twelve")
             result = parser(d) if d else None
+
             if result and result["price"] > 0:
-                ws_age = time.time() - _live_cache.get("ws_last_tick", 0)
-                # v6.4: si Massive WS activo, HTTP solo complementa (no sobreescribe)
-                if not ws_active or ws_age > 3:
-                    _live_cache["price"] = result
-                    _live_cache["price_ts"] = time.time()
+                # Calcular ch/chp desde precio anterior — no depender del API
+                prev = _live_cache.get("price", {})
+                prev_p = prev.get("price", 0) if prev else 0
+                if prev_p > 0 and prev_p != result["price"]:
+                    ch  = round(result["price"] - prev_p, 2)
+                    chp = round(ch / prev_p * 100, 4)
+                    result["ch"]  = ch
+                    result["chp"] = chp
+                elif prev_p > 0:
+                    result["ch"]  = prev.get("ch",  0)
+                    result["chp"] = prev.get("chp", 0)
+
+                if not ws_healthy or ws_age > 3:
+                    _live_cache["price"]      = result
+                    _live_cache["price_ts"]   = time.time()
                     _live_cache["price_fails"] = 0
                     push_price(result["price"])
                     _push_sse("price", result)
