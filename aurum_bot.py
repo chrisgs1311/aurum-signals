@@ -40,69 +40,38 @@ _ict_prices_15m = _scalp_prices_15m
 
 
 
-# v6.4: URLs de precio — Massive PRIMERO (si hay key), luego gold-api, luego Twelve Data
-# Massive da el mismo feed que TradingView Forex.com con unlimited calls
-def _parse_massive_price(d):
-    """Parse respuesta de Massive snapshot forex.
-    Formato snapshot: {status:"OK", ticker:{day:{c:..}, lastQuote:{a:bid,b:ask,...}}}"""
-    if not d or d.get("status") != "OK": return None
-    # Snapshot endpoint
-    t = d.get("ticker", {})
-    lq = t.get("lastQuote", {})
-    bid = lq.get("b") or lq.get("B")
-    ask = lq.get("a") or lq.get("A")
-    if bid and ask:
-        mid = (float(bid) + float(ask)) / 2
-        return {"price": mid, "ch": 0, "chp": 0, "bid": float(bid), "ask": float(ask)}
-    # Fallback: last trade
-    lt = t.get("lastTrade", {})
-    p = lt.get("p") or lt.get("P")
-    if p:
-        return {"price": float(p), "ch": 0, "chp": 0}
-    return None
-
-_PRICE_APIS = []
-if MASSIVE_API_KEY:
-    # Primario: Massive snapshot forex (equivalente Polygon /v2/snapshot)
+# Fuentes de precio en orden de prioridad:
+# 1. gold-api.com  — sin API key, confiable, ~3s delay permitido
+# 2. Twelve Data REST — si hay key
+# 3. Massive REST — si hay key (las quotes forex de Massive pueden fallar para XAU)
+_PRICE_APIS = [
+    (
+        "https://api.gold-api.com/price/XAU",
+        lambda d: {"price": float(d["price"]), "ch": float(d.get("ch", 0)), "chp": float(d.get("chp", 0))}
+                  if d and "price" in d else None,
+    ),
+]
+if TWELVE_API_KEY:
     _PRICE_APIS.append((
-        f"https://api.massive.com/v2/snapshot/locale/global/markets/forex/tickers/C:XAUUSD?apikey={MASSIVE_API_KEY}",
-        _parse_massive_price,
+        f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={TWELVE_API_KEY}",
+        lambda d: {"price": float(d["price"]), "ch": 0, "chp": 0} if d and d.get("price") else None,
+    ))
+if MASSIVE_API_KEY:
+    _PRICE_APIS.append((
+        f"https://api.massive.com/v2/last/trade/C:XAUUSD?apikey={MASSIVE_API_KEY}",
+        lambda d: {"price": float(d["results"]["p"]), "ch": 0, "chp": 0}
+                  if d and d.get("status") == "OK" and d.get("results", {}).get("p") else None,
     ))
 
-# Backup 1: gold-api.com (spot LBMA, 100% confiable, sin API key)
-_PRICE_APIS.append((
-    "https://api.gold-api.com/price/XAU",
-    lambda d: {"price": float(d["price"]), "ch": float(d.get("ch",0)), "chp": float(d.get("chp",0))} if "price" in d else None,
-))
-# Backup 2: Twelve Data REST
-_PRICE_APIS.append((
-    f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={TWELVE_API_KEY}",
-    lambda d: {"price": float(d["price"]), "ch": 0, "chp": 0} if d.get("price") else None,
-))
-# Backup 3: metalpriceapi
-_PRICE_APIS.append((
-    "https://api.metalpriceapi.com/v1/latest?api_key=demo&base=XAU&currencies=USD",
-    lambda d: {"price": float(d["rates"]["USD"]), "ch": 0, "chp": 0} if d.get("rates",{}).get("USD") else None,
-))
-
-if MASSIVE_API_KEY:
-    print(f"  ✓ Massive API activa — precio Forex.com feed + unlimited calls")
-else:
-    print(f"  ⚠ Sin MASSIVE_API_KEY — usando gold-api como primario")
+print(f"  ✓ Fuentes de precio cargadas: {len(_PRICE_APIS)} APIs")
 
 def _worker_price():
-    """Worker #1: precio vía HTTP. Agresivo si WS silent > 10s."""
+    """Worker #1: precio vía HTTP REST. Duerme 3s para no rate-limitear gold-api."""
     api_idx = 0
+    consecutive_fails = 0
     while True:
         try:
-            ws_active  = _live_cache.get("ws_active", False)
-            ws_age     = time.time() - _live_cache.get("ws_last_tick", 0)
-            ws_healthy = ws_active and ws_age < 10
-
-            if MASSIVE_API_KEY:
-                sleep_time = 1
-            else:
-                sleep_time = 5 if not ws_healthy else 15
+            sleep_time = 3
 
             url, parser = _PRICE_APIS[api_idx]
             if "twelvedata.com" in url and not _can_call_twelve():
@@ -134,11 +103,11 @@ def _worker_price():
                 push_price(result["price"])
                 _push_sse("price", result)
             else:
-                _live_cache["price_fails"] = _live_cache.get("price_fails", 0) + 1
-                if _live_cache["price_fails"] >= 3:
+                consecutive_fails += 1
+                if consecutive_fails >= 2:
                     api_idx = (api_idx + 1) % len(_PRICE_APIS)
-                    _live_cache["price_fails"] = 0
-                    print(f"  🔄 Price API fallback → {_PRICE_APIS[api_idx][0][:40]}...")
+                    consecutive_fails = 0
+                    print(f"  🔄 Price API fallback → {_PRICE_APIS[api_idx][0][:50]}...")
         except Exception as e:
             print(f"  ⚠ Price worker: {e}")
         is_data_stale()
@@ -1778,18 +1747,7 @@ function initSSE(){
   if(evtSource)evtSource.close();
   evtSource=new EventSource('/stream');
   evtSource.addEventListener('price',function(e){
-    try{
-      const pd=JSON.parse(e.data);
-      if(pd&&pd.price){
-        // v6.4: precio directo, sin interpolación — Massive ya es tick-by-tick real
-        document.getElementById('priceDisplay').textContent='$'+pd.price.toFixed(2);
-        const ch=pd.ch||0,chp=pd.chp||0;
-        const el=document.getElementById('priceChange');
-        el.textContent=(ch>=0?'+':'')+ch.toFixed(2)+' ('+(ch>=0?'+':'')+Number(chp).toFixed(2)+'%)';
-        el.className='price-change '+(ch>=0?'up':'down');
-        prices.push(pd.price);if(prices.length>300)prices=prices.slice(-300);
-      }
-    }catch(err){}
+    try{const pd=JSON.parse(e.data);_updatePriceDisplay(pd);}catch(err){}
   });
   evtSource.addEventListener('signal',function(e){
     try{
@@ -1837,6 +1795,24 @@ function initSSE(){
   evtSource.onerror=function(){setTimeout(initSSE,3000)};
 }
 initSSE();
+
+// Polling de seguridad: si SSE no entrega precio en 8s, hacer polling REST
+let _lastPriceUpdate=Date.now();
+function _updatePriceDisplay(pd){
+  if(!pd||!pd.price)return;
+  document.getElementById('priceDisplay').textContent='$'+pd.price.toFixed(2);
+  const ch=pd.ch||0,chp=pd.chp||0;
+  const el=document.getElementById('priceChange');
+  el.textContent=(ch>=0?'+':'')+ch.toFixed(2)+' ('+(ch>=0?'+':'')+Number(chp).toFixed(2)+'%)';
+  el.className='price-change '+(ch>=0?'up':'down');
+  prices.push(pd.price);if(prices.length>300)prices=prices.slice(-300);
+  _lastPriceUpdate=Date.now();
+}
+setInterval(function(){
+  if(Date.now()-_lastPriceUpdate>8000){
+    fetch('/precio').then(r=>r.json()).then(_updatePriceDisplay).catch(()=>{});
+  }
+},4000);
 
 // v6.1: polling 3s con Promise.all (paralelo)
 async function fetchAndAnalyze(){
