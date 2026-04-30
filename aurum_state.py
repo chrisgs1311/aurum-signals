@@ -21,7 +21,10 @@ import urllib.request
 
 def _fetch_with_retry(url, headers=None, timeout=10, retries=3, backoff=1.0):
     """HTTP GET con retry + exponential backoff."""
-    hdrs = headers or {"User-Agent": "Mozilla/5.0"}
+    hdrs = headers or {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
     last_err = None
     for attempt in range(retries):
         try:

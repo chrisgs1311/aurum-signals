@@ -40,11 +40,26 @@ _ict_prices_15m = _scalp_prices_15m
 
 
 
-# Fuentes de precio en orden de prioridad:
-# 1. gold-api.com  — sin API key, confiable, ~3s delay permitido
-# 2. Twelve Data REST — si hay key
-# 3. Massive REST — si hay key (las quotes forex de Massive pueden fallar para XAU)
+# Fuentes HTTP de precio en orden de prioridad
+# Yahoo Finance: gratis, sin API key, actualiza cada ~3s durante mercado
+def _parse_yahoo(d):
+    try:
+        meta = d["chart"]["result"][0]["meta"]
+        p    = float(meta.get("regularMarketPrice") or meta.get("price") or 0)
+        prev = float(meta.get("chartPreviousClose") or p)
+        if p > 0:
+            ch  = round(p - prev, 2)
+            chp = round(ch / prev * 100, 3) if prev else 0
+            return {"price": p, "ch": ch, "chp": chp}
+    except Exception:
+        pass
+    return None
+
 _PRICE_APIS = [
+    (
+        "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?interval=1m&range=1d",
+        _parse_yahoo,
+    ),
     (
         "https://api.gold-api.com/price/XAU",
         lambda d: {"price": float(d["price"]), "ch": float(d.get("ch", 0)), "chp": float(d.get("chp", 0))}
@@ -63,7 +78,7 @@ if MASSIVE_API_KEY:
                   if d and d.get("status") == "OK" and d.get("results", {}).get("p") else None,
     ))
 
-print(f"  ✓ Fuentes de precio cargadas: {len(_PRICE_APIS)} APIs")
+print(f"  ✓ Fuentes de precio: {len(_PRICE_APIS)} APIs | primaria: Yahoo Finance XAUUSD")
 
 def _worker_price():
     """Worker #1: precio vía HTTP REST. Duerme 3s para no rate-limitear gold-api."""
@@ -339,11 +354,7 @@ def _worker_websocket():
     Auto-reconnect si se cae. Marca _live_cache['ws_active'] para que el HTTP
     worker reduzca frecuencia."""
     while True:
-        # v6.4: si hay Massive, no usar Twelve Data WebSocket
-        if MASSIVE_API_KEY:
-            time.sleep(60)
-            continue
-        # v6.3: si la key fue marcada como inválida, el worker no intenta conectar
+        # Si la key fue marcada como inválida, no intentar conectar
         if _live_cache.get("twelve_key_invalid"):
             _live_cache["ws_active"] = False
             time.sleep(60)
