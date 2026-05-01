@@ -294,11 +294,11 @@ def _worker_websocket_massive():
                     time.sleep(300)
                     continue
 
-            # 4) Suscribir — PUNTO como separador (protocolo Polygon WebSocket)
-            # C.XAUUSD = quotes (bid/ask), CA.XAUUSD = agregados por minuto
+            # 4) Suscribir — formato Massive WebSocket: CANAL.{from}-{to}
+            # El formato correcto es XAU-USD (con guión), NO XAUUSD ni XAU:USD
             _ws_send_frame(sock, json.dumps({
                 "action": "subscribe",
-                "params": "C.XAUUSD,CA.XAUUSD"
+                "params": "C.XAU-USD,CAS.XAU-USD,CA.XAU-USD"
             }))
 
             # 5) Leer respuesta de suscripción
