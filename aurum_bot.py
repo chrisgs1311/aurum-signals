@@ -40,45 +40,68 @@ _ict_prices_15m = _scalp_prices_15m
 
 
 
-# Fuentes HTTP de precio en orden de prioridad
-# Yahoo Finance: gratis, sin API key, actualiza cada ~3s durante mercado
+# Fuentes HTTP de precio — orden según fiabilidad desde servidores cloud
+def _parse_massive_rest(d):
+    """Snapshot forex Massive/Polygon: /v2/snapshot/locale/global/markets/forex/tickers/C:XAUUSD"""
+    try:
+        if not d or d.get("status") != "OK": return None
+        t  = d.get("ticker", {})
+        lq = t.get("lastQuote", {})
+        bid = lq.get("b") or lq.get("B")
+        ask = lq.get("a") or lq.get("A")
+        if bid and ask:
+            mid = (float(bid) + float(ask)) / 2
+            ch  = float(t.get("todaysChange", 0))
+            chp = float(t.get("todaysChangePerc", 0))
+            return {"price": mid, "ch": round(ch, 2), "chp": round(chp, 3),
+                    "bid": float(bid), "ask": float(ask)}
+        lt = t.get("lastTrade", {})
+        p  = lt.get("p")
+        if p:
+            return {"price": float(p), "ch": float(t.get("todaysChange", 0)),
+                    "chp": float(t.get("todaysChangePerc", 0))}
+    except Exception:
+        pass
+    return None
+
 def _parse_yahoo(d):
     try:
         meta = d["chart"]["result"][0]["meta"]
-        p    = float(meta.get("regularMarketPrice") or meta.get("price") or 0)
+        p    = float(meta.get("regularMarketPrice") or 0)
         prev = float(meta.get("chartPreviousClose") or p)
         if p > 0:
-            ch  = round(p - prev, 2)
-            chp = round(ch / prev * 100, 3) if prev else 0
+            ch = round(p - prev, 2); chp = round(ch / prev * 100, 3) if prev else 0
             return {"price": p, "ch": ch, "chp": chp}
     except Exception:
         pass
     return None
 
-_PRICE_APIS = [
-    (
-        "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?interval=1m&range=1d",
-        _parse_yahoo,
-    ),
-    (
-        "https://api.gold-api.com/price/XAU",
-        lambda d: {"price": float(d["price"]), "ch": float(d.get("ch", 0)), "chp": float(d.get("chp", 0))}
-                  if d and "price" in d else None,
-    ),
-]
+_PRICE_APIS = []
+# 1º Massive REST (si key disponible) — el usuario la paga, sin rate limit
+if MASSIVE_API_KEY:
+    _PRICE_APIS.append((
+        f"https://api.massive.com/v2/snapshot/locale/global/markets/forex/tickers/C:XAUUSD?apiKey={MASSIVE_API_KEY}",
+        _parse_massive_rest,
+    ))
+# 2º Twelve Data REST (si key disponible) — funciona desde Render, tiene limit diario
 if TWELVE_API_KEY:
     _PRICE_APIS.append((
         f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={TWELVE_API_KEY}",
         lambda d: {"price": float(d["price"]), "ch": 0, "chp": 0} if d and d.get("price") else None,
     ))
-if MASSIVE_API_KEY:
-    _PRICE_APIS.append((
-        f"https://api.massive.com/v2/last/trade/C:XAUUSD?apikey={MASSIVE_API_KEY}",
-        lambda d: {"price": float(d["results"]["p"]), "ch": 0, "chp": 0}
-                  if d and d.get("status") == "OK" and d.get("results", {}).get("p") else None,
-    ))
+# 3º Yahoo Finance — gratuito, puede bloquearse desde cloud IPs
+_PRICE_APIS.append((
+    "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?interval=1m&range=1d",
+    _parse_yahoo,
+))
+# 4º gold-api.com — gratuito, se rate-limita si se abusa
+_PRICE_APIS.append((
+    "https://api.gold-api.com/price/XAU",
+    lambda d: {"price": float(d["price"]), "ch": float(d.get("ch", 0)), "chp": float(d.get("chp", 0))}
+              if d and "price" in d else None,
+))
 
-print(f"  ✓ Fuentes de precio: {len(_PRICE_APIS)} APIs | primaria: Yahoo Finance XAUUSD")
+print(f"  ✓ Fuentes precio HTTP: {len(_PRICE_APIS)} | primaria: {'Massive REST' if MASSIVE_API_KEY else 'Twelve Data' if TWELVE_API_KEY else 'Yahoo Finance'}")
 
 def _worker_price():
     """Worker #1: precio vía HTTP REST. Duerme 3s para no rate-limitear gold-api."""
@@ -237,116 +260,113 @@ def _ws_recv_frame(sock):
     return payload.decode("utf-8", errors="ignore")
 
 def _worker_websocket_massive():
-    """v6.4: Worker WebSocket Massive.com → precio real-time forex (tick-by-tick).
-    Subscribe al channel CAS.C:XAUUSD (Second Aggregates) o C.C:XAUUSD (Quotes).
-    
-    Flow del protocolo Massive:
-    1) Conectar → recibir {status:"connected"}
-    2) Enviar {action:"auth", params:"API_KEY"} → recibir {status:"auth_success"}
-    3) Enviar {action:"subscribe", params:"CAS.C:XAUUSD,C.C:XAUUSD"}
-    4) Recibir arrays de eventos
+    """Worker WebSocket Massive.com → XAU/USD tick-by-tick.
+    Protocolo Polygon: suscripción con PUNTO (C.XAUUSD), no dos puntos (C:XAUUSD).
+    Los dos puntos son para el API REST; el WebSocket usa punto como separador.
     """
+    _msg_count = [0]  # contador de mensajes para debug
+
     while True:
         sock = None
         try:
             if not MASSIVE_API_KEY:
                 time.sleep(60)
                 continue
-            print("  🔌 Conectando WebSocket Massive...")
+
+            print("  🔌 [Massive WS] Conectando a socket.massive.com/forex ...")
             sock = _ws_connect_massive()
             sock.settimeout(30)
-            
-            # Esperar status:connected
+
+            # 1) Leer frame inicial (status:connected)
             initial = _ws_recv_frame(sock)
-            if initial:
-                print(f"  📡 Massive: {initial[:100]}")
-            
-            # Auth
-            auth_msg = json.dumps({"action": "auth", "params": MASSIVE_API_KEY})
-            _ws_send_frame(sock, auth_msg)
-            
-            # Esperar auth_success
+            print(f"  📡 [Massive WS] Inicial: {(initial or '')[:150]}")
+
+            # 2) Autenticar
+            _ws_send_frame(sock, json.dumps({"action": "auth", "params": MASSIVE_API_KEY}))
+
+            # 3) Leer respuesta de auth
             auth_resp = _ws_recv_frame(sock)
+            print(f"  📡 [Massive WS] Auth resp: {(auth_resp or '')[:150]}")
             if auth_resp and "auth_success" not in auth_resp:
-                if "auth_failed" in auth_resp or "error" in auth_resp.lower():
-                    print(f"  ❌ Massive auth failed: {auth_resp[:200]}")
+                if "auth_failed" in auth_resp or "not_authorized" in auth_resp:
+                    print("  ❌ [Massive WS] Auth fallida — key inválida")
                     _live_cache["massive_key_invalid"] = True
-                    raise Exception("auth failed")
-            
-            print("  ✅ Massive WebSocket autenticado")
-            
-            # Formato Massive/Polygon: CHANNEL:TICKER (igual que REST: C:XAUUSD)
-            sub_msg = json.dumps({
+                    time.sleep(300)
+                    continue
+
+            # 4) Suscribir — PUNTO como separador (protocolo Polygon WebSocket)
+            # C.XAUUSD = quotes (bid/ask), CA.XAUUSD = agregados por minuto
+            _ws_send_frame(sock, json.dumps({
                 "action": "subscribe",
-                "params": "C:XAUUSD,CAS:XAUUSD,CA:XAUUSD"
-            })
-            _ws_send_frame(sock, sub_msg)
-            print("  ✅ Subscribed C:XAUUSD (quotes + per-second + per-minute)")
-            
-            _live_cache["ws_active"] = True
+                "params": "C.XAUUSD,CA.XAUUSD"
+            }))
+
+            # 5) Leer respuesta de suscripción
+            sub_resp = _ws_recv_frame(sock)
+            print(f"  📡 [Massive WS] Sub resp: {(sub_resp or '')[:150]}")
+
+            _live_cache["ws_active"]   = True
             _live_cache["ws_provider"] = "massive"
+            _msg_count[0] = 0
             last_price = 0
-            
+            print("  ✅ [Massive WS] Listo — esperando ticks XAU/USD ...")
+
             while True:
                 try:
                     msg = _ws_recv_frame(sock)
-                    if not msg: continue
+                    if not msg:
+                        continue
                     events = json.loads(msg)
                     if not isinstance(events, list):
                         events = [events]
+
                     for ev in events:
                         ev_type = ev.get("ev", "")
-                        # Debug: log cualquier evento recibido la primera vez
-                        if not _live_cache.get("ws_first_tick_logged"):
-                            print(f"  📊 Massive primer evento: {str(ev)[:200]}")
-                            _live_cache["ws_first_tick_logged"] = True
-                        # Quote: {"ev":"C","p":"XAU/USD","x":48,"a":4793.25,"b":4793.15,"t":...}
-                        if ev_type == "C":
-                            bid = ev.get("b")
-                            ask = ev.get("a")
+
+                        # Log completo de los primeros 30 mensajes para debug
+                        if _msg_count[0] < 30:
+                            print(f"  📊 [Massive WS] msg#{_msg_count[0]} ev={ev_type}: {str(ev)[:200]}")
+                        _msg_count[0] += 1
+
+                        if ev_type == "C":          # Quote: bid/ask
+                            bid = ev.get("b") or ev.get("B")
+                            ask = ev.get("a") or ev.get("A")
                             if bid and ask:
-                                price = (float(bid) + float(ask)) / 2
-                                last_price = price
-                        # Per-Second Aggregate: {"ev":"CAS","pair":"XAU/USD","o":..,"c":..,...}
-                        elif ev_type == "CAS":
-                            close = ev.get("c")
-                            if close:
-                                price = float(close)
-                                last_price = price
-                        # Per-Minute Aggregate: {"ev":"CA","pair":"XAU/USD","o":..,"c":..,...}
-                        elif ev_type == "CA":
-                            close = ev.get("c")
-                            if close:
-                                price = float(close)
-                                last_price = price
-                        # Status message (auth_success, subscribed, etc)
+                                last_price = (float(bid) + float(ask)) / 2
+
+                        elif ev_type in ("CA", "CAS"):  # Agregados minuto/segundo
+                            c = ev.get("c")
+                            if c:
+                                last_price = float(c)
+
                         elif ev_type == "status":
-                            print(f"  📡 Massive status: {ev.get('message', str(ev))[:150]}")
-                        
+                            print(f"  📡 [Massive WS] status: {ev.get('message', str(ev))[:150]}")
+
                         if last_price > 0:
-                            _prev_data = _live_cache.get("price")
-                            prev = _prev_data.get("price", last_price) if isinstance(_prev_data, dict) else last_price
-                            ch = last_price - prev if prev else 0
-                            chp = (ch / prev * 100) if prev else 0
-                            result = {"price": last_price, "ch": round(ch, 2), "chp": round(chp, 3)}
+                            _prev = _live_cache.get("price")
+                            prev_p = _prev.get("price", last_price) if isinstance(_prev, dict) else last_price
+                            ch  = round(last_price - prev_p, 2)
+                            chp = round(ch / prev_p * 100, 3) if prev_p else 0
+                            result = {"price": last_price, "ch": ch, "chp": chp}
                             if ev_type == "C" and bid and ask:
-                                result["bid"] = float(bid)
-                                result["ask"] = float(ask)
+                                result["bid"]    = float(bid)
+                                result["ask"]    = float(ask)
                                 result["spread"] = round(float(ask) - float(bid), 2)
-                            _live_cache["price"] = result
-                            _live_cache["price_ts"] = time.time()
+                            _live_cache["price"]        = result
+                            _live_cache["price_ts"]     = time.time()
                             _live_cache["ws_last_tick"] = time.time()
                             push_price(last_price)
                             _push_sse("price", result)
+
                 except socket.timeout:
-                    # Massive no requiere ping manual, solo mantener la conexión
-                    continue
+                    continue  # Massive no necesita ping manual
+
         except Exception as e:
-            print(f"  ⚠ Massive WebSocket: {e} — reintentando en 10s")
+            print(f"  ⚠ [Massive WS] Error: {e} — reintentando en 15s")
             _live_cache["ws_active"] = False
             try: sock.close()
             except: pass
-            time.sleep(10)
+            time.sleep(15)
 
 def _worker_websocket():
     """Worker #6: WebSocket Twelve Data → precio tiempo real (~1 tick/seg).
