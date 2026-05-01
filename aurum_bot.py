@@ -40,76 +40,77 @@ _ict_prices_15m = _scalp_prices_15m
 
 
 
-# Fuentes HTTP de precio — orden según fiabilidad desde servidores cloud
-def _parse_massive_rest(d):
-    """Snapshot forex Massive/Polygon: /v2/snapshot/locale/global/markets/forex/tickers/C:XAUUSD"""
+# ── FUENTES HTTP DE PRECIO ───────────────────────────────
+def _parse_massive_nbbo(d):
+    if not d or d.get("status") != "OK": return None
+    r = d.get("results", {})
+    bid = r.get("b") or r.get("B") or r.get("bid")
+    ask = r.get("a") or r.get("A") or r.get("ask")
+    if bid and ask:
+        return {"price": round((float(bid)+float(ask))/2, 2), "ch":0,"chp":0,
+                "bid":float(bid),"ask":float(ask)}
+    return None
+
+def _parse_goldapi(d):
+    if not d: return None
+    p = d.get("price") or d.get("gold") or d.get("XAU")
+    if p:
+        return {"price":float(p),"ch":float(d.get("ch",0)),"chp":float(d.get("chp",0))}
+    return None
+
+def _parse_metals_live(d):
+    # metals.live devuelve [{metal, price, ...}] o {"gold": price}
     try:
-        if not d or d.get("status") != "OK": return None
-        t  = d.get("ticker", {})
-        lq = t.get("lastQuote", {})
-        bid = lq.get("b") or lq.get("B")
-        ask = lq.get("a") or lq.get("A")
-        if bid and ask:
-            mid = (float(bid) + float(ask)) / 2
-            ch  = float(t.get("todaysChange", 0))
-            chp = float(t.get("todaysChangePerc", 0))
-            return {"price": mid, "ch": round(ch, 2), "chp": round(chp, 3),
-                    "bid": float(bid), "ask": float(ask)}
-        lt = t.get("lastTrade", {})
-        p  = lt.get("p")
-        if p:
-            return {"price": float(p), "ch": float(t.get("todaysChange", 0)),
-                    "chp": float(t.get("todaysChangePerc", 0))}
-    except Exception:
-        pass
+        if isinstance(d, list):
+            for item in d:
+                if item.get("metal","").lower() in ("gold","xau"):
+                    return {"price":float(item["price"]),"ch":0,"chp":0}
+        elif isinstance(d, dict):
+            p = d.get("gold") or d.get("XAU") or d.get("price")
+            if p: return {"price":float(p),"ch":0,"chp":0}
+    except Exception: pass
     return None
 
 def _parse_yahoo(d):
     try:
         meta = d["chart"]["result"][0]["meta"]
-        p    = float(meta.get("regularMarketPrice") or 0)
+        p = float(meta.get("regularMarketPrice") or 0)
         prev = float(meta.get("chartPreviousClose") or p)
         if p > 0:
-            ch = round(p - prev, 2); chp = round(ch / prev * 100, 3) if prev else 0
-            return {"price": p, "ch": ch, "chp": chp}
-    except Exception:
-        pass
+            return {"price":p,"ch":round(p-prev,2),"chp":round((p-prev)/prev*100,3) if prev else 0}
+    except Exception: pass
     return None
 
 _PRICE_APIS = []
-# 1º Massive REST (si key disponible) — el usuario la paga, sin rate limit
 if MASSIVE_API_KEY:
     _PRICE_APIS.append((
-        f"https://api.massive.com/v2/snapshot/locale/global/markets/forex/tickers/C:XAUUSD?apiKey={MASSIVE_API_KEY}",
-        _parse_massive_rest,
+        f"https://api.massive.com/v2/last/nbbo/C:XAUUSD?apikey={MASSIVE_API_KEY}",
+        _parse_massive_nbbo,
     ))
-# 2º Twelve Data REST (si key disponible) — funciona desde Render, tiene limit diario
 if TWELVE_API_KEY:
     _PRICE_APIS.append((
         f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={TWELVE_API_KEY}",
-        lambda d: {"price": float(d["price"]), "ch": 0, "chp": 0} if d and d.get("price") else None,
+        lambda d: {"price":float(d["price"]),"ch":0,"chp":0} if d and d.get("price") else None,
     ))
-# 3º Yahoo Finance — gratuito, puede bloquearse desde cloud IPs
-_PRICE_APIS.append((
-    "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?interval=1m&range=1d",
-    _parse_yahoo,
-))
-# 4º gold-api.com — gratuito, se rate-limita si se abusa
-_PRICE_APIS.append((
-    "https://api.gold-api.com/price/XAU",
-    lambda d: {"price": float(d["price"]), "ch": float(d.get("ch", 0)), "chp": float(d.get("chp", 0))}
-              if d and "price" in d else None,
-))
+# Fuentes gratuitas de respaldo
+_PRICE_APIS += [
+    ("https://api.gold-api.com/price/XAU",                                     _parse_goldapi),
+    ("https://api.metals.live/v1/spot/gold",                                    _parse_metals_live),
+    ("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?interval=1m&range=1d", _parse_yahoo),
+]
 
-print(f"  ✓ Fuentes precio HTTP: {len(_PRICE_APIS)} | primaria: {'Massive REST' if MASSIVE_API_KEY else 'Twelve Data' if TWELVE_API_KEY else 'Yahoo Finance'}")
+print(f"  ✓ Fuentes precio: {len(_PRICE_APIS)} APIs")
 
 def _worker_price():
-    """Worker #1: precio vía HTTP REST. Duerme 3s para no rate-limitear gold-api."""
+    """Worker HTTP de precio. Lógica original: gate en ws_age, sleep=1s con Massive."""
     api_idx = 0
-    consecutive_fails = 0
+    price_fails = 0
     while True:
         try:
-            sleep_time = 3
+            ws_active = _live_cache.get("ws_active", False)
+            ws_age    = time.time() - _live_cache.get("ws_last_tick", 0)
+            # Sleep original: 1s con Massive key (unlimited), 30s si WS activo / 5s si no
+            sleep_time = 1 if MASSIVE_API_KEY else (30 if ws_active else 5)
 
             url, parser = _PRICE_APIS[api_idx]
             if "twelvedata.com" in url and not _can_call_twelve():
@@ -121,36 +122,34 @@ def _worker_price():
                 _count_api_call("twelve")
             result = parser(d) if d else None
 
-            if result and result["price"] > 0:
-                # Calcular ch/chp desde precio anterior — no depender del API
+            if result and result.get("price", 0) > 0:
+                # Calcular ch/chp desde precio anterior
                 prev = _live_cache.get("price")
                 prev_p = prev.get("price", 0) if isinstance(prev, dict) else 0
                 if prev_p > 0 and prev_p != result["price"]:
-                    ch  = round(result["price"] - prev_p, 2)
-                    chp = round(ch / prev_p * 100, 4)
-                    result["ch"]  = ch
-                    result["chp"] = chp
+                    result["ch"]  = round(result["price"] - prev_p, 2)
+                    result["chp"] = round(result["ch"] / prev_p * 100, 4)
                 elif prev_p > 0:
-                    result["ch"]  = prev.get("ch",  0)
+                    result["ch"]  = prev.get("ch", 0)
                     result["chp"] = prev.get("chp", 0)
-
-                # Siempre actualizar — WS y HTTP coexisten (más updates = mejor)
-                _live_cache["price"]      = result
-                _live_cache["price_ts"]   = time.time()
-                _live_cache["price_fails"] = 0
-                push_price(result["price"])
-                _push_sse("price", result)
+                # Gate original: HTTP no sobreescribe si WS está activo y fresco
+                if not ws_active or ws_age > 3:
+                    _live_cache["price"]    = result
+                    _live_cache["price_ts"] = time.time()
+                    push_price(result["price"])
+                    _push_sse("price", result)
+                price_fails = 0
             else:
-                consecutive_fails += 1
-                if consecutive_fails >= 2:
+                price_fails += 1
+                if price_fails >= 3:
                     api_idx = (api_idx + 1) % len(_PRICE_APIS)
-                    consecutive_fails = 0
-                    print(f"  🔄 Price API fallback → {_PRICE_APIS[api_idx][0][:50]}...")
+                    price_fails = 0
+                    print(f"  🔄 Price fallback → {_PRICE_APIS[api_idx][0][:50]}...")
         except Exception as e:
             print(f"  ⚠ Price worker: {e}")
         is_data_stale()
-        if _live_cache["price_stale"]:
-            _push_sse("stale", {"type": "price", "age_sec": round(time.time() - _live_cache["price_ts"], 1)})
+        if _live_cache.get("price_stale"):
+            _push_sse("stale", {"type":"price","age_sec":round(time.time()-_live_cache["price_ts"],1)})
         time.sleep(sleep_time)
 
 # ── WEBSOCKET TWELVE DATA (v6.2) ─────────────────────────
