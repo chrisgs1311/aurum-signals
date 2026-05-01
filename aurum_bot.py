@@ -2774,6 +2774,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "risk_consec_losses": risk_get_today_stats()["consecutive_losses"],
             }).encode())
 
+        # /apitest — prueba todas las APIs de precio en tiempo real
+        elif path == "/apitest":
+            results = []
+            test_apis = list(_PRICE_APIS)
+            # Añadir variantes extra de Massive para diagnosticar cuál funciona
+            if MASSIVE_API_KEY:
+                extras = [
+                    f"https://api.massive.com/v2/last/nbbo/C:XAUUSD?apikey={MASSIVE_API_KEY}",
+                    f"https://api.massive.com/v1/last_quote/currencies/XAU/USD?apiKey={MASSIVE_API_KEY}",
+                    f"https://api.massive.com/v2/aggs/ticker/C:XAUUSD/range/1/minute/2024-01-01/2025-12-31?adjusted=true&sort=desc&limit=1&apiKey={MASSIVE_API_KEY}",
+                ]
+                for url in extras:
+                    test_apis.append((url, lambda d: d))  # parser crudo
+            for url, parser in test_apis:
+                safe_url = url.replace(MASSIVE_API_KEY, "***").replace(TWELVE_API_KEY, "***") if MASSIVE_API_KEY or TWELVE_API_KEY else url
+                try:
+                    d = _fetch_with_retry(url, timeout=8, retries=1, backoff=0)
+                    result = parser(d) if d else None
+                    results.append({
+                        "url": safe_url[:80],
+                        "raw": str(d)[:300] if d else None,
+                        "parsed": str(result)[:200] if result else None,
+                        "ok": bool(result and isinstance(result, dict) and result.get("price", 0) > 0)
+                    })
+                except Exception as e:
+                    results.append({"url": safe_url[:80], "error": str(e)[:150], "ok": False})
+            self._send(200, "application/json", json.dumps({
+                "ws_active": _live_cache.get("ws_active", False),
+                "ws_provider": _live_cache.get("ws_provider", "none"),
+                "ws_last_tick_age_sec": round(time.time() - _live_cache.get("ws_last_tick", 0), 1) if _live_cache.get("ws_last_tick") else -1,
+                "price_cached": _live_cache.get("price"),
+                "apis": results,
+            }, indent=2).encode())
+
         # /scalpscore — estado del motor SCALP v2
         elif path == "/scalpscore":
             atr_v = 0
