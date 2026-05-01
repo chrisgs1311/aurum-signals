@@ -1807,8 +1807,7 @@ function initSSE(){
 }
 initSSE();
 
-// Polling de seguridad: si SSE no entrega precio en 8s, hacer polling REST
-let _lastPriceUpdate=Date.now();
+// Actualización de precio — usada tanto por SSE como por polling HTTP
 function _updatePriceDisplay(pd){
   if(!pd||!pd.price)return;
   document.getElementById('priceDisplay').textContent='$'+pd.price.toFixed(2);
@@ -1817,13 +1816,11 @@ function _updatePriceDisplay(pd){
   el.textContent=(ch>=0?'+':'')+ch.toFixed(2)+' ('+(ch>=0?'+':'')+Number(chp).toFixed(2)+'%)';
   el.className='price-change '+(ch>=0?'up':'down');
   prices.push(pd.price);if(prices.length>300)prices=prices.slice(-300);
-  _lastPriceUpdate=Date.now();
 }
+// Polling HTTP incondicional cada 3s — garantía absoluta independiente de SSE
 setInterval(function(){
-  if(Date.now()-_lastPriceUpdate>8000){
-    fetch('/precio').then(r=>r.json()).then(_updatePriceDisplay).catch(()=>{});
-  }
-},4000);
+  fetch('/precio').then(r=>r.json()).then(_updatePriceDisplay).catch(()=>{});
+},3000);
 
 // v6.1: polling 3s con Promise.all (paralelo)
 async function fetchAndAnalyze(){
@@ -2479,6 +2476,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("X-Accel-Buffering", "no")   # Render/nginx: no bufferizar SSE
             self.end_headers()
             q = []
             with _sse_lock:
