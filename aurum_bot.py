@@ -41,15 +41,20 @@ _ict_prices_15m = _scalp_prices_15m
 
 
 # ── FUENTES HTTP DE PRECIO ───────────────────────────────
-def _parse_massive_nbbo(d):
-    if not d or d.get("status") != "OK": return None
-    r = d.get("results", {})
-    bid = r.get("b") or r.get("B") or r.get("bid")
-    ask = r.get("a") or r.get("A") or r.get("ask")
-    if bid and ask:
-        return {"price": round((float(bid)+float(ask))/2, 2), "ch":0,"chp":0,
-                "bid":float(bid),"ask":float(ask)}
+def _parse_massive_aggs(d):
+    try:
+        if not d or d.get("status") != "OK": return None
+        results = d.get("results", [])
+        if results:
+            return {"price": float(results[-1]["c"]), "ch": 0, "chp": 0}
+    except Exception: pass
     return None
+
+def _massive_price_url():
+    now_ms = int(time.time() * 1000)
+    from_ms = now_ms - 5 * 60 * 1000  # últimos 5 minutos
+    return (f"https://api.massive.com/v2/aggs/ticker/C:XAUUSD/range/1/minute/"
+            f"{from_ms}/{now_ms}?adjusted=true&sort=desc&limit=1&apikey={MASSIVE_API_KEY}")
 
 def _parse_goldapi(d):
     if not d: return None
@@ -83,16 +88,14 @@ def _parse_yahoo(d):
 
 _PRICE_APIS = []
 if MASSIVE_API_KEY:
-    _PRICE_APIS.append((
-        f"https://api.massive.com/v2/last/nbbo/C:XAUUSD?apikey={MASSIVE_API_KEY}",
-        _parse_massive_nbbo,
-    ))
+    # URL callable: genera timestamps frescos en cada llamada
+    _PRICE_APIS.append((_massive_price_url, _parse_massive_aggs))
 if TWELVE_API_KEY:
     _PRICE_APIS.append((
         f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={TWELVE_API_KEY}",
         lambda d: {"price":float(d["price"]),"ch":0,"chp":0} if d and d.get("price") else None,
     ))
-# Fuentes gratuitas de respaldo
+# Fuentes gratuitas (pueden dar 403 desde IPs cloud, pero como último recurso)
 _PRICE_APIS += [
     ("https://api.gold-api.com/price/XAU",                                     _parse_goldapi),
     ("https://api.metals.live/v1/spot/gold",                                    _parse_metals_live),
@@ -102,20 +105,24 @@ _PRICE_APIS += [
 print(f"  ✓ Fuentes precio: {len(_PRICE_APIS)} APIs")
 
 def _worker_price():
-    """Worker HTTP de precio. Lógica original: gate en ws_age, sleep=1s con Massive."""
+    """Worker HTTP de precio. Gate basado solo en ws_age (sin flag ws_active)."""
     api_idx = 0
     price_fails = 0
     while True:
         try:
-            ws_active = _live_cache.get("ws_active", False)
-            ws_age    = time.time() - _live_cache.get("ws_last_tick", 0)
-            # Sleep original: 1s con Massive key (unlimited), 30s si WS activo / 5s si no
-            sleep_time = 1 if MASSIVE_API_KEY else (30 if ws_active else 5)
+            ws_age = time.time() - _live_cache.get("ws_last_tick", 0)
+            ws_fresh = ws_age < 5  # WS dio tick hace menos de 5s
 
-            url, parser = _PRICE_APIS[api_idx]
+            # Si WS está vivo y fresco, HTTP solo verifica cada 5s
+            sleep_time = 5 if ws_fresh else (2 if MASSIVE_API_KEY else (30 if TWELVE_API_KEY else 5))
+
+            url_or_fn, parser = _PRICE_APIS[api_idx]
+            url = url_or_fn() if callable(url_or_fn) else url_or_fn
+
             if "twelvedata.com" in url and not _can_call_twelve():
                 api_idx = (api_idx + 1) % len(_PRICE_APIS)
-                url, parser = _PRICE_APIS[api_idx]
+                url_or_fn, parser = _PRICE_APIS[api_idx]
+                url = url_or_fn() if callable(url_or_fn) else url_or_fn
 
             d = _fetch_with_retry(url, timeout=5, retries=1, backoff=0.5)
             if "twelvedata.com" in url:
@@ -123,7 +130,6 @@ def _worker_price():
             result = parser(d) if d else None
 
             if result and result.get("price", 0) > 0:
-                # Calcular ch/chp desde precio anterior
                 prev = _live_cache.get("price")
                 prev_p = prev.get("price", 0) if isinstance(prev, dict) else 0
                 if prev_p > 0 and prev_p != result["price"]:
@@ -132,8 +138,8 @@ def _worker_price():
                 elif prev_p > 0:
                     result["ch"]  = prev.get("ch", 0)
                     result["chp"] = prev.get("chp", 0)
-                # Gate original: HTTP no sobreescribe si WS está activo y fresco
-                if not ws_active or ws_age > 3:
+                # Solo escribir si WS lleva más de 5s sin datos (evita sobreescribir ticks frescos)
+                if not ws_fresh:
                     _live_cache["price"]    = result
                     _live_cache["price_ts"] = time.time()
                     push_price(result["price"])
@@ -144,7 +150,9 @@ def _worker_price():
                 if price_fails >= 3:
                     api_idx = (api_idx + 1) % len(_PRICE_APIS)
                     price_fails = 0
-                    print(f"  🔄 Price fallback → {_PRICE_APIS[api_idx][0][:50]}...")
+                    next_url = _PRICE_APIS[api_idx][0]
+                    next_label = next_url() if callable(next_url) else next_url
+                    print(f"  🔄 Price fallback → {next_label[:60]}...")
         except Exception as e:
             print(f"  ⚠ Price worker: {e}")
         is_data_stale()
@@ -362,7 +370,7 @@ def _worker_websocket_massive():
 
         except Exception as e:
             print(f"  ⚠ [Massive WS] Error: {e} — reintentando en 15s")
-            _live_cache["ws_active"] = False
+            # No borrar ws_active: el gate usa ws_last_tick age, no el flag
             try: sock.close()
             except: pass
             time.sleep(15)
@@ -420,7 +428,7 @@ def _worker_websocket():
                     continue
         except Exception as e:
             print(f"  ⚠ WebSocket Twelve: {e} — reintentando en 10s")
-            _live_cache["ws_active"] = False
+            # No borrar ws_active: el gate usa ws_last_tick age, no el flag
             try: sock.close()
             except: pass
             time.sleep(10)
@@ -1828,7 +1836,7 @@ initSSE();
 
 // Actualización de precio — usada tanto por SSE como por polling HTTP
 function _updatePriceDisplay(pd){
-  if(!pd||!pd.price)return;
+  if(!pd||pd.price==null||pd.price===undefined||pd.price<=0)return;
   document.getElementById('priceDisplay').textContent='$'+pd.price.toFixed(2);
   const ch=pd.ch||0,chp=pd.chp||0;
   const el=document.getElementById('priceChange');
