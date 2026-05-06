@@ -41,6 +41,38 @@ _ict_prices_15m = _scalp_prices_15m
 
 
 # ── FUENTES HTTP DE PRECIO ───────────────────────────────
+def _parse_massive_snapshot(d):
+    """Snapshot endpoint — precio actual (lastQuote bid/ask o lastTrade price)."""
+    try:
+        if not d or d.get("status") != "OK": return None
+        t = d.get("ticker", {})
+        q = t.get("lastQuote", {})
+        bid = q.get("b") or q.get("bid") or q.get("B")
+        ask = q.get("a") or q.get("ask") or q.get("A")
+        if bid and ask:
+            return {"price": round((float(bid)+float(ask))/2, 2), "ch":0,"chp":0,
+                    "bid":float(bid),"ask":float(ask)}
+        tr = t.get("lastTrade",{})
+        p = tr.get("p") or tr.get("price")
+        if p: return {"price": float(p), "ch":0,"chp":0}
+    except Exception as ex:
+        print(f"  ⚠ Massive snapshot parse: {ex} | {str(d)[:120]}")
+    return None
+
+def _parse_massive_lastquote(d):
+    """Last quote endpoint — bid/ask en tiempo real."""
+    try:
+        if not d or d.get("status") != "OK": return None
+        r = d.get("results", {})
+        bid = r.get("b") or r.get("bid") or r.get("B")
+        ask = r.get("a") or r.get("ask") or r.get("A")
+        if bid and ask:
+            return {"price": round((float(bid)+float(ask))/2, 2), "ch":0,"chp":0,
+                    "bid":float(bid),"ask":float(ask)}
+    except Exception as ex:
+        print(f"  ⚠ Massive lastquote parse: {ex} | {str(d)[:120]}")
+    return None
+
 def _parse_massive_aggs(d):
     try:
         if not d:
@@ -49,12 +81,12 @@ def _parse_massive_aggs(d):
         status = d.get("status")
         results = d.get("results", [])
         if status != "OK":
-            print(f"  ⚠ Massive aggs: status={status} resultsCount={d.get('resultsCount',0)} err={d.get('error','')}")
+            print(f"  ⚠ Massive aggs: status={status} err={d.get('error','')}")
             return None
         if not results:
             print(f"  ⚠ Massive aggs: OK pero sin velas (resultsCount={d.get('resultsCount',0)})")
             return None
-        return {"price": float(results[-1]["c"]), "ch": 0, "chp": 0}  # sort=asc → [-1] es el más reciente
+        return {"price": float(results[-1]["c"]), "ch": 0, "chp": 0}
     except Exception as ex:
         print(f"  ⚠ Massive aggs parse error: {ex} | data={str(d)[:100]}")
     return None
@@ -62,7 +94,6 @@ def _parse_massive_aggs(d):
 def _massive_price_url():
     now_ms = int(time.time() * 1000)
     from_ms = now_ms - 30 * 60 * 1000  # últimos 30 minutos
-    # sort=asc igual que OHLC (confirmado funcional); results[-1] = más reciente
     return (f"https://api.massive.com/v2/aggs/ticker/C:XAUUSD/range/1/minute/"
             f"{from_ms}/{now_ms}?adjusted=true&sort=asc&limit=5&apikey={MASSIVE_API_KEY}")
 
@@ -96,8 +127,19 @@ def _parse_yahoo(d):
     except Exception: pass
     return None
 
-# Solo Massive — WS primario, aggs REST de respaldo
-_PRICE_APIS = [(_massive_price_url, _parse_massive_aggs)]
+# Solo Massive — WS primario; REST: snapshot → last_quote → aggs (orden de frescura)
+_PRICE_APIS = []
+if MASSIVE_API_KEY:
+    _PRICE_APIS += [
+        # Snapshot: precio actual con bid/ask (más fresco)
+        (f"https://api.massive.com/v2/snapshot/locale/global/markets/forex/tickers/C:XAUUSD?apikey={MASSIVE_API_KEY}",
+         _parse_massive_snapshot),
+        # Last quote: bid/ask en tiempo real
+        (f"https://api.massive.com/v1/last_quote/currencies/XAU/USD?apiKey={MASSIVE_API_KEY}",
+         _parse_massive_lastquote),
+        # Aggs: último cierre de vela (1 min de lag, pero confirmado funcional)
+        (_massive_price_url, _parse_massive_aggs),
+    ]
 
 print(f"  ✓ Fuentes precio: {len(_PRICE_APIS)} APIs")
 
@@ -151,6 +193,11 @@ def _worker_price():
                 price_fails = 0
             else:
                 price_fails += 1
+                if price_fails >= 3 and len(_PRICE_APIS) > 1:
+                    api_idx = (api_idx + 1) % len(_PRICE_APIS)
+                    price_fails = 0
+                    _nu = _PRICE_APIS[api_idx][0]
+                    print(f"  🔄 Price fallback → API#{api_idx} ({(_nu() if callable(_nu) else _nu)[:55]}...)")
         except Exception as e:
             print(f"  ⚠ Price worker: {e}")
         is_data_stale()
@@ -299,11 +346,10 @@ def _worker_websocket_massive():
                     time.sleep(300)
                     continue
 
-            # 4) Suscribir — formato Massive WebSocket: CANAL.{from}-{to}
-            # El formato correcto es XAU-USD (con guión), NO XAUUSD ni XAU:USD
+            # 4) Suscribir — probar ambos formatos (con y sin guión)
             _ws_send_frame(sock, json.dumps({
                 "action": "subscribe",
-                "params": "C.XAU-USD,CAS.XAU-USD,CA.XAU-USD"
+                "params": "C.XAU-USD,C.XAUUSD,CAS.XAU-USD,CA.XAU-USD,CAS.XAUUSD"
             }))
 
             # 5) Leer respuesta de suscripción
