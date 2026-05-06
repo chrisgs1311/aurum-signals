@@ -86,21 +86,8 @@ def _parse_yahoo(d):
     except Exception: pass
     return None
 
-_PRICE_APIS = []
-if MASSIVE_API_KEY:
-    # URL callable: genera timestamps frescos en cada llamada
-    _PRICE_APIS.append((_massive_price_url, _parse_massive_aggs))
-if TWELVE_API_KEY:
-    _PRICE_APIS.append((
-        f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={TWELVE_API_KEY}",
-        lambda d: {"price":float(d["price"]),"ch":0,"chp":0} if d and d.get("price") else None,
-    ))
-# Fuentes gratuitas (pueden dar 403 desde IPs cloud, pero como último recurso)
-_PRICE_APIS += [
-    ("https://api.gold-api.com/price/XAU",                                     _parse_goldapi),
-    ("https://api.metals.live/v1/spot/gold",                                    _parse_metals_live),
-    ("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?interval=1m&range=1d", _parse_yahoo),
-]
+# Solo Massive — WS primario, aggs REST de respaldo
+_PRICE_APIS = [(_massive_price_url, _parse_massive_aggs)]
 
 print(f"  ✓ Fuentes precio: {len(_PRICE_APIS)} APIs")
 
@@ -113,20 +100,13 @@ def _worker_price():
             ws_age = time.time() - _live_cache.get("ws_last_tick", 0)
             ws_fresh = ws_age < 5  # WS dio tick hace menos de 5s
 
-            # Si WS está vivo y fresco, HTTP solo verifica cada 5s
-            sleep_time = 5 if ws_fresh else (2 if MASSIVE_API_KEY else (30 if TWELVE_API_KEY else 5))
+            # WS fresco → HTTP en standby (5s); WS caído → HTTP activo (2s)
+            sleep_time = 5 if ws_fresh else 2
 
             url_or_fn, parser = _PRICE_APIS[api_idx]
             url = url_or_fn() if callable(url_or_fn) else url_or_fn
 
-            if "twelvedata.com" in url and not _can_call_twelve():
-                api_idx = (api_idx + 1) % len(_PRICE_APIS)
-                url_or_fn, parser = _PRICE_APIS[api_idx]
-                url = url_or_fn() if callable(url_or_fn) else url_or_fn
-
             d = _fetch_with_retry(url, timeout=5, retries=1, backoff=0.5)
-            if "twelvedata.com" in url:
-                _count_api_call("twelve")
             result = parser(d) if d else None
 
             if result and result.get("price", 0) > 0:
@@ -624,8 +604,7 @@ def start_all_workers():
     _load_paper_trades()
     workers = [
         ("Massive WS (real-time)", _worker_websocket_massive),
-        ("Twelve WS (fallback)",   _worker_websocket),
-        ("Price HTTP",             _worker_price),
+        ("Price HTTP (Massive)",   _worker_price),
         ("OHLC Feed",              _worker_ohlc),
         ("Signal Engine (1s)",     _worker_signal),
         ("ML Train (5min)",        _worker_train),
