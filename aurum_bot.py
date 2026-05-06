@@ -54,16 +54,17 @@ def _parse_massive_aggs(d):
         if not results:
             print(f"  ⚠ Massive aggs: OK pero sin velas (resultsCount={d.get('resultsCount',0)})")
             return None
-        return {"price": float(results[0]["c"]), "ch": 0, "chp": 0}
+        return {"price": float(results[-1]["c"]), "ch": 0, "chp": 0}  # sort=asc → [-1] es el más reciente
     except Exception as ex:
         print(f"  ⚠ Massive aggs parse error: {ex} | data={str(d)[:100]}")
     return None
 
 def _massive_price_url():
     now_ms = int(time.time() * 1000)
-    from_ms = now_ms - 30 * 60 * 1000  # últimos 30 minutos (cubre pausa de mercado)
+    from_ms = now_ms - 30 * 60 * 1000  # últimos 30 minutos
+    # sort=asc igual que OHLC (confirmado funcional); results[-1] = más reciente
     return (f"https://api.massive.com/v2/aggs/ticker/C:XAUUSD/range/1/minute/"
-            f"{from_ms}/{now_ms}?adjusted=true&sort=desc&limit=1&apikey={MASSIVE_API_KEY}")
+            f"{from_ms}/{now_ms}?adjusted=true&sort=asc&limit=5&apikey={MASSIVE_API_KEY}")
 
 def _parse_goldapi(d):
     if not d: return None
@@ -112,6 +113,20 @@ def _worker_price():
             # WS fresco → HTTP en standby (5s); WS caído → HTTP activo (2s)
             sleep_time = 5 if ws_fresh else 2
 
+            # Semilla inmediata: si aún no hay precio, usar último cierre del caché OHLC
+            if not _live_cache.get("price"):
+                for _ok in ("ohlc_5m", "ohlc_15m", "ohlc_1h"):
+                    _oc = _live_cache.get(_ok, [])
+                    if _oc:
+                        _cl = _oc[-1].get("close") or _oc[-1].get("c")
+                        if _cl and float(_cl) > 0:
+                            _live_cache["price"] = {"price": float(_cl), "ch": 0, "chp": 0}
+                            _live_cache["price_ts"] = time.time()
+                            push_price(float(_cl))
+                            _push_sse("price", _live_cache["price"])
+                            print(f"  🔄 Precio seed OHLC ({_ok}): {_cl}")
+                            break
+
             url_or_fn, parser = _PRICE_APIS[api_idx]
             url = url_or_fn() if callable(url_or_fn) else url_or_fn
 
@@ -127,7 +142,7 @@ def _worker_price():
                 elif prev_p > 0:
                     result["ch"]  = prev.get("ch", 0)
                     result["chp"] = prev.get("chp", 0)
-                # Solo escribir si WS lleva más de 5s sin datos (evita sobreescribir ticks frescos)
+                # Solo escribir si WS lleva más de 5s sin datos
                 if not ws_fresh:
                     _live_cache["price"]    = result
                     _live_cache["price_ts"] = time.time()
@@ -136,17 +151,6 @@ def _worker_price():
                 price_fails = 0
             else:
                 price_fails += 1
-                # Fallback: si aggs falla, usar última vela del caché OHLC
-                if price_fails >= 3 and not _live_cache.get("price"):
-                    ohlc = _live_cache.get("ohlc_5m") or _live_cache.get("ohlc_15m") or []
-                    if ohlc:
-                        last_close = ohlc[-1].get("close") or ohlc[-1].get("c")
-                        if last_close:
-                            _live_cache["price"] = {"price": float(last_close), "ch": 0, "chp": 0}
-                            _live_cache["price_ts"] = time.time()
-                            push_price(float(last_close))
-                            _push_sse("price", _live_cache["price"])
-                            print(f"  🔄 Precio desde caché OHLC: {last_close}")
         except Exception as e:
             print(f"  ⚠ Price worker: {e}")
         is_data_stale()
