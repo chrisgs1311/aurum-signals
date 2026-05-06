@@ -1880,6 +1880,13 @@ async function fetchAndAnalyze(){
       el.textContent=(ch>=0?'+':'')+ch.toFixed(2)+' ('+(ch>=0?'+':'')+Number(chp).toFixed(2)+'%)';
       el.className='price-change '+(ch>=0?'up':'down');
       document.getElementById('sourceBadge').innerHTML=document.getElementById('sourceBadge').innerHTML||'<span class="source-badge live">● EN VIVO</span>';
+    }else if(Array.isArray(ohlcR)&&ohlcR.length>0){
+      // Sin precio live: usar último cierre de OHLC como seed visual
+      const seed=ohlcR[ohlcR.length-1].close||ohlcR[ohlcR.length-1].c||0;
+      if(seed>0){
+        document.getElementById('priceDisplay').textContent='$'+Number(seed).toFixed(2);
+        document.getElementById('priceChange').textContent='+0.00 (+0.00%)';
+      }
     }else if(!prices.length){
       document.getElementById('priceDisplay').textContent='Esperando datos...';
       document.getElementById('priceChange').textContent='Workers iniciando...';
@@ -2535,6 +2542,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # v6.1: /precio — lectura instantánea + stale flag
         elif path == "/precio":
             c = _live_cache["price"]
+            if not c:
+                # Fallback directo al caché OHLC — mismo dato que ya carga en pantalla
+                for _ok in ("ohlc_5m", "ohlc_15m", "ohlc_1h"):
+                    _oc = _live_cache.get(_ok, [])
+                    if _oc:
+                        _cl = _oc[-1].get("close") or _oc[-1].get("c")
+                        if _cl and float(_cl) > 0:
+                            c = {"price": float(_cl), "ch": 0, "chp": 0}
+                            _live_cache["price"] = c
+                            _live_cache["price_ts"] = time.time()
+                            break
             if c:
                 c = dict(c)  # no mutar cache
                 c["stale"] = _live_cache.get("price_stale", False)
