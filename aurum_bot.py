@@ -43,16 +43,25 @@ _ict_prices_15m = _scalp_prices_15m
 # ── FUENTES HTTP DE PRECIO ───────────────────────────────
 def _parse_massive_aggs(d):
     try:
-        if not d or d.get("status") != "OK": return None
+        if not d:
+            print("  ⚠ Massive aggs: respuesta vacía (None)")
+            return None
+        status = d.get("status")
         results = d.get("results", [])
-        if results:
-            return {"price": float(results[-1]["c"]), "ch": 0, "chp": 0}
-    except Exception: pass
+        if status != "OK":
+            print(f"  ⚠ Massive aggs: status={status} resultsCount={d.get('resultsCount',0)} err={d.get('error','')}")
+            return None
+        if not results:
+            print(f"  ⚠ Massive aggs: OK pero sin velas (resultsCount={d.get('resultsCount',0)})")
+            return None
+        return {"price": float(results[0]["c"]), "ch": 0, "chp": 0}
+    except Exception as ex:
+        print(f"  ⚠ Massive aggs parse error: {ex} | data={str(d)[:100]}")
     return None
 
 def _massive_price_url():
     now_ms = int(time.time() * 1000)
-    from_ms = now_ms - 5 * 60 * 1000  # últimos 5 minutos
+    from_ms = now_ms - 30 * 60 * 1000  # últimos 30 minutos (cubre pausa de mercado)
     return (f"https://api.massive.com/v2/aggs/ticker/C:XAUUSD/range/1/minute/"
             f"{from_ms}/{now_ms}?adjusted=true&sort=desc&limit=1&apikey={MASSIVE_API_KEY}")
 
@@ -127,12 +136,17 @@ def _worker_price():
                 price_fails = 0
             else:
                 price_fails += 1
-                if price_fails >= 3:
-                    api_idx = (api_idx + 1) % len(_PRICE_APIS)
-                    price_fails = 0
-                    next_url = _PRICE_APIS[api_idx][0]
-                    next_label = next_url() if callable(next_url) else next_url
-                    print(f"  🔄 Price fallback → {next_label[:60]}...")
+                # Fallback: si aggs falla, usar última vela del caché OHLC
+                if price_fails >= 3 and not _live_cache.get("price"):
+                    ohlc = _live_cache.get("ohlc_5m") or _live_cache.get("ohlc_15m") or []
+                    if ohlc:
+                        last_close = ohlc[-1].get("close") or ohlc[-1].get("c")
+                        if last_close:
+                            _live_cache["price"] = {"price": float(last_close), "ch": 0, "chp": 0}
+                            _live_cache["price_ts"] = time.time()
+                            push_price(float(last_close))
+                            _push_sse("price", _live_cache["price"])
+                            print(f"  🔄 Precio desde caché OHLC: {last_close}")
         except Exception as e:
             print(f"  ⚠ Price worker: {e}")
         is_data_stale()
@@ -296,12 +310,17 @@ def _worker_websocket_massive():
             _live_cache["ws_provider"] = "massive"
             _msg_count[0] = 0
             last_price = 0
+            connected_at = time.time()
             print("  ✅ [Massive WS] Listo — esperando ticks XAU/USD ...")
 
             while True:
                 try:
                     msg = _ws_recv_frame(sock)
                     if not msg:
+                        # Watchdog: 60s conectado sin ningún tick → reconectar
+                        if last_price == 0 and time.time() - connected_at > 60:
+                            print("  ⚠ [Massive WS] 60s sin ticks — reconectando...")
+                            raise Exception("no ticks in 60s")
                         continue
                     events = json.loads(msg)
                     if not isinstance(events, list):
